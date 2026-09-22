@@ -136,6 +136,22 @@ test('the key is saved through its own channel, not with the settings blob', () 
   assert.match(app, /field\.value = '';/);
 });
 
+test('the Jev key uses the secret store and its own IPC channel', () => {
+  const { secrets } = store();
+  secrets.set('jevApiKey', 'jev-secret-value');
+  assert.equal(secrets.get('jevApiKey'), 'jev-secret-value');
+
+  const main = read('main.js');
+  const preload = read('preload.js');
+  const app = read('renderer/app.js');
+  assert.match(main, /key: secrets\.describe\('jevApiKey'\)/);
+  assert.match(main, /secrets\.set\('jevApiKey', value\)/);
+  assert.match(preload, /jevSetKey: \(value\) => ipcRenderer\.invoke\('jev:setKey', value\)/);
+  assert.match(app, /window\.api\.jevSetKey\(field\.value\)/);
+  const save = app.slice(app.indexOf("compactionEngine: $('setting-compaction-engine')"), app.indexOf("compactionEngine: $('setting-compaction-engine')") + 500);
+  assert.ok(!save.includes('setting-jev-key'), 'the Jev key must not be part of settingsSave');
+});
+
 test('cloud-only fields are hidden rather than shown dead', () => {
   const app = read('renderer/app.js');
   assert.match(app, /\$\('settings-cloud-fields'\)\.classList\.toggle\('hidden', !cloud\)/);

@@ -2631,6 +2631,7 @@ function gitRun(args, cwd, env) {
 }
 
 const {
+  HOT_TOOL_NAMES,
   NETWORK_TOOLS,
   SENSITIVE_TOOLS,
   DESTRUCTIVE_TOOLS,
@@ -2653,6 +2654,7 @@ module.exports = {
   setAttachedFiles: attachedFiles.setAttachedFiles,
   takeRenderedPages: renderedPages.take,
   TOOL_DEFS,
+  HOT_TOOL_NAMES,
   RISKY_TOOLS,
   SUBAGENT_TOOLS,
   SUBAGENT_TOOL_NAMES,

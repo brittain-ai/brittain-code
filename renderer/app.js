@@ -1548,6 +1548,13 @@ $('settings-save-key')?.addEventListener('click', async () => {
   if (!res.ok) { $('settings-key-status').textContent = res.error; return; }
   await syncProviderFields();
 });
+$('settings-save-jev-key')?.addEventListener('click', async () => {
+  const field = $('setting-jev-key');
+  const res = await window.api.jevSetKey(field.value);
+  field.value = '';
+  if (!res.ok) { $('settings-jev-key-status').textContent = res.error; return; }
+  await syncJevFields();
+});
 
 // What the turn cost, as a quiet line under the answer. Only ever sent on a
 // cloud provider, so its presence is the signal — the renderer does not need to
@@ -2223,6 +2230,15 @@ async function syncProviderFields({ useDefaultEndpoint = false } = {}) {
     : 'No key set yet.';
 }
 
+async function syncJevFields() {
+  const state = await window.api.jevState();
+  const status = $('settings-jev-key-status');
+  if (!state?.ok) { status.textContent = ''; return; }
+  status.textContent = state.key.set
+    ? `Key set (${state.key.hint})${state.key.encrypted ? '' : ' — stored as plain text: this system has no encrypted storage'}`
+    : 'No Jev key set. Jev modes use native compaction.';
+}
+
 function populateSettingsModelSelects(source = appSettings || {}) {
   for (const [id, key] of Object.entries(settingModelFields)) {
     const select = $(id);
@@ -2270,6 +2286,10 @@ function fillSettingsForm(settings) {
   $('setting-main-context-custom').classList.toggle('hidden', $('setting-main-context').value !== 'custom');
   $('setting-auto-compact').checked = !!settings.autoCompact;
   $('setting-compact-threshold').value = Math.round(settings.compactThreshold * 100);
+  $('setting-compaction-engine').value = settings.compactionEngine || 'auto';
+  $('setting-jev-endpoint').value = settings.jevEndpoint || 'https://api.typesafe.ai/v1/systemone';
+  $('setting-jev-model').value = settings.jevModel || 'jev-latest';
+  syncJevFields();
   $('setting-keep-alive').value = settings.keepAlive;
   setTemperatureSelect('setting-code-temperature', settings.codeTemperature);
   setTemperatureSelect('setting-chat-temperature', settings.chatTemperature);
@@ -2298,6 +2318,9 @@ function settingsFromForm() {
     mainContextCap: Number(selectedContext === 'custom' ? $('setting-main-context-custom').value : selectedContext),
     autoCompact: $('setting-auto-compact').checked,
     compactThreshold: Number($('setting-compact-threshold').value) / 100,
+    compactionEngine: $('setting-compaction-engine').value,
+    jevEndpoint: $('setting-jev-endpoint').value.trim(),
+    jevModel: $('setting-jev-model').value.trim(),
     keepAlive: $('setting-keep-alive').value,
     chatModel: $('setting-chat-model').value,
     codeModel: $('setting-code-model').value,

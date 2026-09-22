@@ -153,6 +153,16 @@ test('native Ollama messages keep their existing shape', () => {
   assert.ok(body.messages[0].images, 'Ollama takes a bare base64 array');
 });
 
+test('local tool-call ids are not sent to Ollama', () => {
+  const request = ollamaTransport.request({
+    endpoint: 'http://localhost:11434',
+    model: 'm',
+    messages: [{ role: 'tool', tool_name: 'read_file', tool_call_id: 'call-1', content: 'ok' }],
+  });
+  assert.equal(request.body.messages[0].tool_call_id, undefined);
+  assert.equal(request.body.messages[0].tool_name, 'read_file');
+});
+
 test('OpenAI string tool arguments become the object Ollama requires', () => {
   const messages = [{
     role: 'assistant',

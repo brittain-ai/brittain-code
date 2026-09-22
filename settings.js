@@ -8,6 +8,12 @@ const DEFAULT_SETTINGS = Object.freeze({
   scoutContextCap: 24_576,
   autoCompact: true,
   compactThreshold: 0.7,
+  // Auto uses Jev for Brittain 4 when a Jev key is configured, and keeps the
+  // native summary path for every other model. Shadow scores and records Jev
+  // decisions without applying them to inference.
+  compactionEngine: 'auto',
+  jevEndpoint: 'https://api.typesafe.ai/v1/systemone',
+  jevModel: 'jev-latest',
   keepAlive: '5m',
   codeTemperature: 0.3,
   chatTemperature: 0.6,
@@ -44,6 +50,14 @@ const DEFAULT_SETTINGS = Object.freeze({
   globalChatInstructions: '',
   maxAgentSteps: 50,
   defaultLoopIterations: 8,
+  // Whether to abbreviate the tool payload: send the every-turn tools in full
+  // and the rest as name, one-line summary, and required arguments, filling in
+  // a full schema the first time one is actually called.
+  //
+  // 'auto' turns it on only for a small context window, where the schemas are a
+  // large share of the budget. A big local model keeps the whole payload, since
+  // there the round trip a stub can cost is worth more than the tokens it saves.
+  toolIndex: 'auto',
 });
 
 function clampNumber(value, fallback, min, max) {
@@ -101,6 +115,11 @@ function normalizeSettings(input = {}) {
     scoutContextCap: normalizeContextCap(merged.scoutContextCap, DEFAULT_SETTINGS.scoutContextCap),
     autoCompact: !!merged.autoCompact,
     compactThreshold: clampNumber(merged.compactThreshold, DEFAULT_SETTINGS.compactThreshold, 0.5, 0.9),
+    compactionEngine: ['auto', 'native', 'jev-hybrid', 'shadow'].includes(merged.compactionEngine)
+      ? merged.compactionEngine
+      : DEFAULT_SETTINGS.compactionEngine,
+    jevEndpoint: normalizeEndpoint(merged.jevEndpoint || DEFAULT_SETTINGS.jevEndpoint),
+    jevModel: cleanText(merged.jevModel || DEFAULT_SETTINGS.jevModel, 200),
     keepAlive: ['0', '5m', '30m', '-1'].includes(String(merged.keepAlive)) ? String(merged.keepAlive) : DEFAULT_SETTINGS.keepAlive,
     codeTemperature: clampNumber(merged.codeTemperature, DEFAULT_SETTINGS.codeTemperature, 0, 1.5),
     chatTemperature: clampNumber(merged.chatTemperature, DEFAULT_SETTINGS.chatTemperature, 0, 1.5),
@@ -124,6 +143,7 @@ function normalizeSettings(input = {}) {
     globalChatInstructions: cleanText(merged.globalChatInstructions, 12_000),
     maxAgentSteps: clampInteger(merged.maxAgentSteps, DEFAULT_SETTINGS.maxAgentSteps, 5, 100),
     defaultLoopIterations: clampInteger(merged.defaultLoopIterations, DEFAULT_SETTINGS.defaultLoopIterations, 1, 50),
+    toolIndex: ['auto', 'on', 'off'].includes(merged.toolIndex) ? merged.toolIndex : DEFAULT_SETTINGS.toolIndex,
   };
 }
 

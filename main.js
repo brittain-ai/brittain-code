@@ -17,9 +17,10 @@ const fs = require('fs');
 const os = require('os');
 const { spawn } = require('node:child_process');
 const { McpManager } = require('./mcp');
-const { initTools, setCommandSandbox, setRootProvider, setVisionCheck, setAttachedFiles, takeRenderedPages, TOOL_DEFS, RISKY_TOOLS, NETWORK_TOOLS, SENSITIVE_TOOLS, DESTRUCTIVE_TOOLS, SUBAGENT_TOOLS, SUBAGENT_TOOL_NAMES, ORCHESTRATOR_TOOLS, ORCHESTRATOR_TOOL_NAMES, CODER_TOOLS, CODER_TOOL_NAMES, CHAT_TOOLS, executeTool, isDestructiveCommand, gitRun, memoryPath, readMemory, legacyMemoryPath, readLegacyMemory, stopAllManagedProcesses, SELF_TALK } = require('./tools');
+const { initTools, setCommandSandbox, setRootProvider, setVisionCheck, setAttachedFiles, takeRenderedPages, TOOL_DEFS, HOT_TOOL_NAMES, RISKY_TOOLS, NETWORK_TOOLS, SENSITIVE_TOOLS, DESTRUCTIVE_TOOLS, SUBAGENT_TOOLS, SUBAGENT_TOOL_NAMES, ORCHESTRATOR_TOOLS, ORCHESTRATOR_TOOL_NAMES, CODER_TOOLS, CODER_TOOL_NAMES, CHAT_TOOLS, executeTool, isDestructiveCommand, gitRun, memoryPath, readMemory, legacyMemoryPath, readLegacyMemory, stopAllManagedProcesses, SELF_TALK } = require('./tools');
 const { MAX_ATTACHMENT_FILES, extractFileAttachments, validateImageAttachments } = require('./attachments');
 const { DEFAULT_SETTINGS, normalizeEndpoint, normalizeSettings, loadSettings, saveSettings } = require('./settings');
+const { indexToolDefs, isStubbed, missingRequired, revealedToolNames, schemaReveal } = require('./src/tools/tool-index');
 const { isToolCallParseError, withToolCallRetryInstruction, toolCallFailureMessage } = require('./ollama-recovery');
 const { readActiveMission, writeActiveMission, interruptRunningMission } = require('./missions');
 const { isLocalEndpoint } = require('./recommendations');
@@ -51,6 +52,7 @@ const { outcomeOf, buildLedger, renderLedger, isEmptyLedger } = require('./src/m
 const { boundToolResult, isUnboundedBrowserEvaluation } = require('./src/main/tool-result');
 const { createToolFailureTracker } = require('./src/main/tool-failure');
 const { retainedBudget, tailBudget, summaryBudget, selectVerbatimTail, validateSummary, retryInstruction, summaryInstruction, minimumSummaryTokens, describeCompaction, planChunks, chunkInstruction, reduceInstruction, priorRecordPreamble } = require('./src/main/compaction');
+const { applyStoredDecisions, compactWithJev } = require('./src/main/jev-compaction');
 const { createCheckpointService } = require('./src/main/checkpoint-service');
 const { createDiffService } = require('./src/main/diff-service');
 const { normalizeCodeReview, SUBMIT_CODE_REVIEW_TOOL } = require('./src/main/code-review');
@@ -105,6 +107,25 @@ function compactPercent() {
   return Math.round(compactThreshold() * 100);
 }
 
+function isBrittain4Model(model) {
+  return /(?:^|[/_-])brittain\s*[-_]?4(?:$|[/_.:-])/i.test(String(model || ''))
+    || /^brittain4$/i.test(String(model || ''));
+}
+
+function effectiveCompactionEngine(model) {
+  const selected = runtimeSettings.compactionEngine || 'auto';
+  if (selected !== 'auto') {
+    // An explicit Jev mode still needs a key. Fall back to the native path
+    // before the request loop so a missing key cannot cause one failed Jev
+    // request for every model step.
+    if (['jev-hybrid', 'shadow'].includes(selected) && !secrets.get('jevApiKey')) return 'native';
+    return selected;
+  }
+  return runtimeSettings.provider === 'openai' && isBrittain4Model(model) && !!secrets.get('jevApiKey')
+    ? 'jev-hybrid'
+    : 'native';
+}
+
 async function effectiveContext(model, configuredCap = runtimeSettings.mainContextCap) {
   const cap = configuredCap > 0 ? configuredCap : NUM_CTX_CAP;
   return Math.min(await getContextLength(model), cap);
@@ -132,8 +153,10 @@ function stripOldImages(msgs) {
   });
 }
 
-function modelReadyMessages(msgs) {
-  return stripOldImages(msgs).map(({ displayContent, attachments, imageTypes, pinned, excludedFromInference, compactionRecord, meta, pendingRunId, clientRunId, ...message }) => {
+function modelReadyMessages(msgs, model = conversationView?.model || runtimeSettings.lastModel) {
+  const engine = effectiveCompactionEngine(model);
+  const selected = engine === 'jev-hybrid' ? applyStoredDecisions(msgs).messages : msgs;
+  return stripOldImages(selected).map(({ displayContent, attachments, imageTypes, pinned, excludedFromInference, compactionRecord, jevDecision, meta, pendingRunId, clientRunId, ...message }) => {
     if (excludedFromInference && message.role === 'tool') {
       return { ...message, content: '[Tool result content excluded from inference by the user.]' };
     }
@@ -367,6 +390,10 @@ function freshUsage() {
       toolCallRetries: 0,
       psychosisDetections: 0,
       compactions: 0,
+      jevRequests: 0,
+      jevPrunedTokens: 0,
+      jevFailures: 0,
+      emergencyCompactions: 0,
       loopIterations: 0,
       coderLoopIterations: 0,
       orchestrations: 0,
@@ -445,7 +472,7 @@ function publishContextStats(stats, contextLength, scope = 'provider') {
 function currentConversationTokens(model = conversationView.model) {
   const view = { ...conversationView, model: model || conversationView.model };
   return fixedOverheadTokens(view.cwd, view.model, view.mode, view.onlineResearch)
-    + estimateContextTokens(modelReadyMessages(conversation), { model: view.model });
+    + estimateContextTokens(modelReadyMessages(conversation, view.model), { model: view.model });
 }
 
 function emitPersistedConversationContext(model, contextLength) {
@@ -1706,12 +1733,36 @@ function systemPrompt(cwd, model = '', onlineResearch = false, { remote = false 
 // The context inspector calls this too, so "what will actually be sent" cannot
 // silently drift from what runAgentTurn sends — the exact bug that made /context
 // under-report by the whole tool schema.
-function activeToolDefs(chatMode, onlineResearch) {
+// Below this window, the tool payload is worth more than the round trips that
+// abbreviating it can cost. A 32k served model spends a quarter of its budget on
+// tool schemas; a 262k local one does not notice them.
+const TOOL_INDEX_AUTO_BELOW = 49_152;
+
+// Sync on purpose: both callers of activeToolDefs() are sync, and the context
+// inspector must reach the same answer as the agent turn or it reports a payload
+// that is not the one being sent. Reads the cache getContextLength() fills
+// rather than probing, so an unknown window leaves the payload whole.
+const HOT_TOOLS = new Set(HOT_TOOL_NAMES);
+function toolIndexEnabled(model) {
+  const mode = runtimeSettings.toolIndex;
+  if (mode === 'off') return false;
+  if (mode === 'on') return true;
+  const known = Number(contextCache.get(model)) || 0;
+  return known > 0 && known <= TOOL_INDEX_AUTO_BELOW;
+}
+
+function activeToolDefs(chatMode, onlineResearch, model = runtimeSettings.lastModel, { abbreviate = true } = {}) {
   const modeTools = chatMode ? CHAT_TOOLS : TOOL_DEFS;
   const mcpDefs = mcp.toolDefs();
   const offline = (defs) => defs.filter((definition) => !NETWORK_TOOLS.has(definition.function.name));
+  // MCP definitions are indexed alongside the built-ins. They are written by
+  // whoever wrote the server rather than by this project, and a single verbose
+  // server can outweigh every local tool combined.
+  const index = (defs) => (abbreviate && toolIndexEnabled(model)
+    ? indexToolDefs(defs, { hot: HOT_TOOLS, revealed: revealedToolNames(conversation) })
+    : defs);
 
-  if (!chatMode) return (onlineResearch ? modeTools : offline(modeTools)).concat(mcpDefs);
+  if (!chatMode) return index((onlineResearch ? modeTools : offline(modeTools)).concat(mcpDefs));
 
   // Chat mode used to hand back null whenever ONLINE was off, which dropped the
   // MCP tools with it. That conflated two unrelated permissions: MCP servers
@@ -1722,7 +1773,7 @@ function activeToolDefs(chatMode, onlineResearch) {
 
   // calculate is useful while ONLINE is off and no MCP server is configured,
   // so Chat mode always keeps its small local tool set.
-  return chatTools;
+  return index(chatTools);
 }
 
 // The fixed per-request overhead: system prompt + tool schemas. Both are sent on
@@ -1733,7 +1784,7 @@ function fixedOverheadTokens(cwd, model, mode, onlineResearch) {
   try {
     const chatMode = mode === 'chat';
     const prompt = chatMode ? chatSystemPrompt(onlineResearch) : systemPrompt(cwd, model, onlineResearch);
-    const toolDefs = activeToolDefs(chatMode, onlineResearch) || [];
+    const toolDefs = activeToolDefs(chatMode, onlineResearch, model) || [];
     return estimateTokens({ role: 'system', content: prompt })
       + (toolDefs.length ? estimateTokens(toolDefs) : 0);
   } catch {
@@ -1741,15 +1792,117 @@ function fixedOverheadTokens(cwd, model, mode, onlineResearch) {
   }
 }
 
+const JEV_TRIGGER_FRACTION = 0.50;
+const JEV_TARGET_FRACTION = 0.48;
+
+function responseReserve(contextLength) {
+  return Math.min(4096, Math.max(1024, Math.floor(contextLength * 0.125)));
+}
+
+function contextSafetyMargin(contextLength) {
+  return Math.min(2048, Math.max(512, Math.floor(contextLength * 0.0625)));
+}
+
+function jevOptions(signal) {
+  return {
+    endpoint: runtimeSettings.jevEndpoint,
+    apiKey: secrets.get('jevApiKey'),
+    model: runtimeSettings.jevModel,
+    signal,
+  };
+}
+
+async function prepareAgentMessages({ model, prompt, agentTools, contextLength, signal }) {
+  const system = { role: 'system', content: prompt };
+  const engine = effectiveCompactionEngine(model);
+  const overhead = estimateContextTokens(system, { model }) + estimateTokens(agentTools || []);
+  const hardInput = Math.max(2048, contextLength - responseReserve(contextLength) - contextSafetyMargin(contextLength));
+  const targetTotal = Math.min(hardInput, Math.floor(contextLength * JEV_TARGET_FRACTION));
+  const targetMessages = Math.max(1024, targetTotal - overhead);
+  const ready = () => [system, ...modelReadyMessages(conversation, model)];
+  const requestTokens = () => estimateContextTokens(ready(), { model }) + estimateTokens(agentTools || []);
+  const before = requestTokens();
+
+  if (['jev-hybrid', 'shadow'].includes(engine) && before >= contextLength * JEV_TRIGGER_FRACTION) {
+    const shadow = engine === 'shadow';
+    const result = await compactWithJev(conversation, {
+      ...jevOptions(signal),
+      targetTokens: targetMessages,
+      emergency: !shadow && before > hardInput,
+      estimate: (messages) => estimateContextTokens(modelReadyMessages(messages, model), { model }),
+    });
+    usage.metrics.jevRequests = (usage.metrics.jevRequests || 0) + (result.requests || 0);
+    usage.metrics.jevPrunedTokens = (usage.metrics.jevPrunedTokens || 0) + (result.reducedTokens || 0);
+    if (!result.ok) usage.metrics.jevFailures = (usage.metrics.jevFailures || 0) + 1;
+
+    const selectedTokens = overhead + estimateContextTokens(result.messages, { model });
+    if (shadow) {
+      if (result.requests || result.reducedTokens) {
+        sink.emit('stream:info', `Jev shadow: ${before.toLocaleString()} → ${selectedTokens.toLocaleString()} estimated tokens; live context unchanged.`);
+      }
+    } else if (result.requests || result.reducedTokens) {
+      const detail = result.ok ? '' : `; Jev failed: ${result.error}`;
+      sink.emit('stream:info', `Jev context view: ${before.toLocaleString()} → ${requestTokens().toLocaleString()} estimated tokens (${result.callsDropped} calls dropped, ${result.resultsShortened} results shortened${detail}).`);
+    }
+  }
+
+  const after = requestTokens();
+  if (engine === 'jev-hybrid' && after > hardInput) {
+    // The emergency pass is deterministic and cannot remove user/assistant
+    // dialogue, mutation calls, unresolved errors, pins, or the newest pairs.
+    const result = await compactWithJev(conversation, {
+      ...jevOptions(signal),
+      targetTokens: targetMessages,
+      emergency: true,
+      maxCandidates: 0,
+      estimate: (messages) => estimateContextTokens(modelReadyMessages(messages, model), { model }),
+    });
+    usage.metrics.emergencyCompactions = (usage.metrics.emergencyCompactions || 0) + 1;
+    let finalTokens = requestTokens();
+    if (finalTokens > hardInput) {
+      sink.emit('stream:info', 'Jev could not reduce enough tool context. Trying the native conversation summary…');
+      const native = await compactConversation(model, signal);
+      finalTokens = requestTokens();
+      if (!native.ok || finalTokens > hardInput) {
+        const reason = native.ok
+          ? `the request is still ${finalTokens.toLocaleString()} tokens`
+          : `native compaction failed: ${native.error}`;
+        throw new Error(`Brittain 4 cannot fit this request after Jev and native compaction (${reason}); the hard input budget is ${hardInput.toLocaleString()}. Start a new chat or remove the largest attachment.`);
+      }
+      sink.emit('stream:info', `Native fallback compacted the request to about ${finalTokens.toLocaleString()} tokens.`);
+    }
+    if (result.reducedTokens) {
+      sink.emit('stream:info', `Emergency context pruning removed about ${result.reducedTokens.toLocaleString()} more tokens.`);
+    }
+  }
+
+  return {
+    messages: ready(),
+    maxTokens: engine === 'jev-hybrid' ? responseReserve(contextLength) : 0,
+    estimatedTokens: requestTokens(),
+    hardInput,
+  };
+}
+
 async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineResearch = false, mode = 'code', { remote = false } = {}) {
   const chatMode = mode === 'chat';
   const prompt = chatMode ? chatSystemPrompt(onlineResearch) : systemPrompt(cwd, model, onlineResearch, { remote });
-  const messages = () => [{ role: 'system', content: prompt }, ...modelReadyMessages(conversation)];
-  // external MCP tools go for all
-  const agentTools = activeToolDefs(chatMode, onlineResearch);
-  const activeToolNames = new Set((agentTools || []).map((definition) => definition.function.name));
-  // report the window we actually run with, not the model's theoretical max
+  const messages = () => [{ role: 'system', content: prompt }, ...modelReadyMessages(conversation, model)];
+  // report the window we actually run with, not the model's theoretical max.
+  // Resolved before the tools are assembled because whether the payload is
+  // abbreviated depends on the window, and toolIndexEnabled() reads the cache
+  // this fills rather than probing for it a second time.
   const contextLength = await effectiveContext(model);
+  // external MCP tools go for all
+  const agentTools = activeToolDefs(chatMode, onlineResearch, model);
+  const activeToolNames = new Set((agentTools || []).map((definition) => definition.function.name));
+  // A stub has thrown away the schema the reveal needs to hand back, so the
+  // unabbreviated definitions are kept alongside, keyed by name.
+  const fullToolDefs = new Map((activeToolDefs(chatMode, onlineResearch, model, { abbreviate: false }) || [])
+    .map((definition) => [definition.function.name, definition]));
+  const stubbedNames = new Set((agentTools || [])
+    .filter((definition) => isStubbed(definition, { hot: HOT_TOOLS, revealed: revealedToolNames(conversation) }))
+    .map((definition) => definition.function.name));
   // For models that support thinking, always send an explicit true/false —
   // omitting the param makes Ollama think by default, ignoring the toggle.
   const useThink = await thinkValue(model, think);
@@ -1775,7 +1928,14 @@ async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineRese
     for (let step = 0; step < maxAgentSteps; step++) {
       let content, thinking, toolCalls, stats;
       try {
-        ({ content, thinking, toolCalls, stats } = await streamChat(model, messages(), currentAbort.signal, useThink, false, contextLength, agentTools, { toolCallRetries: 0 }, temperature));
+        const prepared = await prepareAgentMessages({
+          model,
+          prompt,
+          agentTools,
+          contextLength,
+          signal: currentAbort.signal,
+        });
+        ({ content, thinking, toolCalls, stats } = await streamChat(model, prepared.messages, currentAbort.signal, useThink, false, contextLength, agentTools, { toolCallRetries: 0 }, temperature, prepared.maxTokens));
       } catch (err) {
         if (err.name !== 'PsychosisDetectedError') throw err;
         usage.metrics.psychosisDetections = (usage.metrics.psychosisDetections || 0) + 1;
@@ -1842,6 +2002,12 @@ async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineRese
         turnTokens.evalTokens += stats.evalTokens || 0;
       }
 
+      if (toolCalls.length) {
+        toolCalls = toolCalls.map((call, index) => ({
+          ...call,
+          id: call.id || `call_${sessionId}_${conversation.length}_${index}`.replace(/[^A-Za-z0-9_-]/g, '_'),
+        }));
+      }
       const assistantMsg = { role: 'assistant', content };
       if (thinking) assistantMsg.thinking = thinking;
       if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
@@ -1905,6 +2071,17 @@ async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineRese
             ? `Error: Tool unavailable in Chat mode: ${name}. Continue without local file, shell, Git, or project access.`
             : `Error: Tool unavailable for this turn: ${name}. Continue without it.`;
           sink.emit('stream:toolresult', { name, result: preview(result), denied: true });
+        } else if (stubbedNames.has(name) && fullToolDefs.has(name)
+          && missingRequired(fullToolDefs.get(name), args).length) {
+          // The tool was advertised with its required arguments named but not
+          // described, and the call arrived without them. Nothing has run: hand
+          // back the real schema and let the model call it again. An error here
+          // would be a lie — the model picked a real tool, it was just told less
+          // about it than it needed.
+          result = schemaReveal(fullToolDefs.get(name));
+          // Calling it recorded the name in the transcript, so revealedToolNames()
+          // will keep it unabbreviated for the rest of the conversation.
+          sink.emit('stream:toolresult', { name, result: preview(result) });
         } else if (stopRequested) {
           result = 'Cancelled by user.';
         } else if (isUnboundedBrowserEvaluation(name, args)) {
@@ -2030,7 +2207,7 @@ async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineRese
         if (bounded.truncated) {
           sink.emit('stream:info', `Tool result from "${name}" was ${bounded.originalChars.toLocaleString()} characters. Kept a ${bounded.content.length.toLocaleString()}-character excerpt in model context.`);
         }
-        conversation.push({ role: 'tool', tool_name: name, content: bounded.content });
+        conversation.push({ role: 'tool', tool_name: name, tool_call_id: tc.id, content: bounded.content });
         // A call parked just above owns the placeholder result pushed just now:
         // record its index so resume can swap in the real result.
         const lastParked = currentRun?.parked?.length ? currentRun.parked[currentRun.parked.length - 1] : null;
@@ -2075,7 +2252,7 @@ async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineRese
         // tool definitions, so compaction runs before the next model call.
         const estimatedNow = estimateContextTokens(messages(), { model }) + estimateTokens(agentTools || []);
         const used = Math.max(measured, estimatedNow);
-        if (shouldAutoCompact(used, contextLength)) {
+        if (shouldAutoCompact(used, contextLength) && effectiveCompactionEngine(model) !== 'jev-hybrid') {
           sink.emit('stream:info', `Context past ${compactPercent()}% — auto-compacting…`);
           sink.emit('stream:state', 'compacting');
           const c = await compactConversation(model);
@@ -2189,6 +2366,10 @@ async function emitRunReport(cwd, runLog, runCheckpoint = null) {
 // request context-shifts and the model silently loses its oldest messages.
 async function maybePrecompact(model) {
   if (conversation.length < 2) return;
+  // Jev runs against completed tool pairs immediately before every Brittain 4
+  // request. Running the destructive native path here would discard the full
+  // transcript before the reversible selector gets a chance to reduce it.
+  if (effectiveCompactionEngine(model) === 'jev-hybrid') return;
   const contextLength = await effectiveContext(model);
   const estimated = currentConversationTokens(model);
   if (!shouldAutoCompact(estimated, contextLength)) return;
@@ -4962,11 +5143,15 @@ ipcMain.handle('context:inspect', async (_e, { model, cwd, mode, onlineResearch 
     rememberConversationView({ model, cwd, mode, onlineResearch });
     const chatMode = mode === 'chat';
     const prompt = chatMode ? chatSystemPrompt(onlineResearch) : systemPrompt(cwd, model, onlineResearch);
-    const ready = modelReadyMessages(conversation);
+    const selected = effectiveCompactionEngine(model) === 'jev-hybrid'
+      ? applyStoredDecisions(conversation)
+      : { messages: conversation, sourceIndices: conversation.map((_, index) => index) };
+    const ready = modelReadyMessages(selected.messages, model);
     const contextLength = await effectiveContext(model);
 
     const rows = ready.map((msg, i) => {
-      const original = conversation[i];
+      const sourceIndex = selected.sourceIndices[i];
+      const original = conversation[sourceIndex];
       const flags = [];
       if (original && original.images?.length && !msg.images?.length) flags.push('images evicted');
       if (typeof msg.content === 'string' && msg.content.includes('[an attached image was removed')) {
@@ -4976,7 +5161,7 @@ ipcMain.handle('context:inspect', async (_e, { model, cwd, mode, onlineResearch 
       if (original?.pinned) flags.push('pinned');
       if (original?.excludedFromInference) flags.push('tool output excluded');
       return {
-        index: i,
+        index: sourceIndex,
         role: msg.role,
         toolName: msg.tool_name || null,
         toolCalls: msg.tool_calls || original?.tool_calls || null,
@@ -4992,7 +5177,7 @@ ipcMain.handle('context:inspect', async (_e, { model, cwd, mode, onlineResearch 
     const systemTokens = estimateTokens({ role: 'system', content: prompt });
     // Tool schemas are part of every request and are usually the largest single
     // component in code mode, so they belong in the total the inspector reports.
-    const toolDefs = activeToolDefs(chatMode, onlineResearch) || [];
+    const toolDefs = activeToolDefs(chatMode, onlineResearch, model) || [];
     const mcpDefs = mcp.toolDefs() || [];
     const mcpToolNames = new Set(mcpDefs.map((def) => def.function?.name || def.name));
     const tools = toolDefs.map((def) => {
@@ -5069,6 +5254,24 @@ ipcMain.handle('provider:state', () => ({
 ipcMain.handle('provider:setKey', (_e, value) => {
   try {
     const result = secrets.set('providerApiKey', value);
+    return { ok: true, encrypted: result.encrypted };
+  } catch (err) {
+    return { ok: false, error: String(err.message || err) };
+  }
+});
+
+ipcMain.handle('jev:state', () => ({
+  ok: true,
+  endpoint: runtimeSettings.jevEndpoint,
+  model: runtimeSettings.jevModel,
+  engine: runtimeSettings.compactionEngine,
+  key: secrets.describe('jevApiKey'),
+  encryptionAvailable: secrets.encrypted(),
+}));
+
+ipcMain.handle('jev:setKey', (_e, value) => {
+  try {
+    const result = secrets.set('jevApiKey', value);
     return { ok: true, encrypted: result.encrypted };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -5160,7 +5363,7 @@ ipcMain.handle('context:control', (_e, payload = {}) => {
 ipcMain.handle('chat:load', async (_e, msgs, model, savedUsage, savedContextState, view = {}) => {
   if (runInFlight()) {
     const loadedConversation = Array.isArray(msgs) ? msgs : [];
-    const approxTokens = estimateContextTokens(modelReadyMessages(loadedConversation), { model })
+    const approxTokens = estimateContextTokens(modelReadyMessages(loadedConversation, model), { model })
       + fixedOverheadTokens(view.cwd, model, view.mode, !!view.onlineResearch);
     const contextLength = model ? await effectiveContext(model) : 0;
     return { ok: true, deferred: true, approxTokens, contextLength };
@@ -5554,6 +5757,53 @@ async function compactConversation(model, signal = currentAbort?.signal) {
     const contextLength = await effectiveContext(model);
     const before = currentConversationTokens(model);
 
+    if (effectiveCompactionEngine(model) === 'jev-hybrid') {
+      const overhead = fixedOverheadTokens(
+        conversationView.cwd,
+        model,
+        conversationView.mode,
+        conversationView.onlineResearch,
+      );
+      const targetMessages = Math.max(1024, Math.floor(contextLength * JEV_TARGET_FRACTION) - overhead);
+      const jev = await compactWithJev(conversation, {
+        ...jevOptions(signal),
+        targetTokens: targetMessages,
+        emergency: true,
+        estimate: (messages) => estimateContextTokens(modelReadyMessages(messages, model), { model }),
+      });
+      const afterJev = currentConversationTokens(model);
+      usage.metrics.jevRequests = (usage.metrics.jevRequests || 0) + (jev.requests || 0);
+      usage.metrics.jevPrunedTokens = (usage.metrics.jevPrunedTokens || 0) + Math.max(0, before - afterJev);
+      if (!jev.ok) usage.metrics.jevFailures = (usage.metrics.jevFailures || 0) + 1;
+      if (afterJev < before && afterJev <= Math.floor(contextLength * 0.55)) {
+        usage.metrics.compactions += 1;
+        const result = {
+          ok: true,
+          approxTokens: afterJev,
+          contextLength,
+          before,
+          after: afterJev,
+          summaryTokens: 0,
+          tailTurns: 0,
+          tailTokens: 0,
+          retries: 0,
+          degraded: false,
+          unstructured: false,
+          ledgerEntries: 0,
+          chunks: 0,
+          carriedPriorRecord: false,
+          engine: 'jev-hybrid',
+        };
+        return {
+          ...result,
+          description: `${before.toLocaleString()} → ${afterJev.toLocaleString()} tokens · Jev kept the full saved transcript · ${jev.callsDropped} calls dropped · ${jev.resultsShortened} results shortened`,
+        };
+      }
+      // Selection cannot compress long user/assistant dialogue. Continue into
+      // the native summary path only when the reversible view did not buy back
+      // enough room.
+    }
+
     const pinnedConversation = conversation
       .filter((message) => message?.pinned && (message.role === 'user' || message.role === 'assistant'))
       .map(({ tool_calls, ...message }) => ({ ...message }));
@@ -5567,7 +5817,7 @@ async function compactConversation(model, signal = currentAbort?.signal) {
     // Measure vision patches instead of base64 transport bytes. Old images are
     // still evicted at the inference boundary, while the newest image receives
     // a bounded estimate for the selected model family.
-    const sendableTokens = (messages) => estimateContextTokens(modelReadyMessages(messages), { model });
+    const sendableTokens = (messages) => estimateContextTokens(modelReadyMessages(messages, model), { model });
 
     // Keep the most recent complete turns verbatim. They are the most relevant
     // part of the conversation and the cheapest fidelity available, and the
@@ -5584,7 +5834,7 @@ async function compactConversation(model, signal = currentAbort?.signal) {
     // drop images and bulky tool outputs from what the summarizer sees — the
     // summarizer must not context-shift itself
     const windowBudget = Math.floor(contextLength * 0.8);
-    const summarizerInput = modelReadyMessages(transcript)
+    const summarizerInput = modelReadyMessages(transcript, model)
       .map((m) =>
         m.role === 'tool' && String(m.content).length > 1500
           ? { ...m, content: String(m.content).slice(0, 1500) + '…[truncated]' }

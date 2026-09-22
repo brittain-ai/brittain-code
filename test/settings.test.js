@@ -53,6 +53,10 @@ test('normalizes settings into safe runtime bounds', () => {
   assert.equal(settings.maxAgentSteps, 100);
   assert.equal(settings.defaultLoopIterations, 1);
   assert.equal(settings.keepAlive, DEFAULT_SETTINGS.keepAlive);
+  assert.equal(normalizeSettings({ compactionEngine: 'jev-hybrid' }).compactionEngine, 'jev-hybrid');
+  assert.equal(normalizeSettings({ compactionEngine: 'unknown' }).compactionEngine, 'auto');
+  assert.equal(normalizeSettings({ jevEndpoint: 'https://api.typesafe.ai/v1/systemone/' }).jevEndpoint,
+    'https://api.typesafe.ai/v1/systemone');
 });
 
 test('saves and reloads the complete settings document', () => {

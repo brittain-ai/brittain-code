@@ -91,6 +91,10 @@ function ollamaToolArguments(value) {
 
 function toOllamaMessages(messages) {
   return (Array.isArray(messages) ? messages : []).map((message) => {
+    if (message?.role === 'tool' && message.tool_call_id) {
+      const { tool_call_id, ...ollamaMessage } = message;
+      return ollamaMessage;
+    }
     if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) return message;
     return {
       ...message,
@@ -132,11 +136,14 @@ function toOpenAIMessages(messages) {
     if (message?.role === 'tool') {
       // Match the result to its call by name, falling back to order. Without an
       // id the provider rejects the whole request.
-      const index = awaiting.findIndex((call) => call.function?.name === message.tool_name);
+      let index = message.tool_call_id
+        ? awaiting.findIndex((call) => call.id === message.tool_call_id)
+        : -1;
+      if (index < 0) index = awaiting.findIndex((call) => call.function?.name === message.tool_name);
       const call = index >= 0 ? awaiting.splice(index, 1)[0] : awaiting.shift();
       out.push({
         role: 'tool',
-        tool_call_id: call?.id || `call_${out.length}`,
+        tool_call_id: message.tool_call_id || call?.id || `call_${out.length}`,
         content: String(message.content ?? ''),
       });
       continue;

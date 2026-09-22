@@ -81,6 +81,8 @@ contextBridge.exposeInMainWorld('api', {
   onTurnCost: (cb) => ipcRenderer.on('stream:cost', (_e, d, route) => cb(d, route)),
   providerState: () => ipcRenderer.invoke('provider:state'),
   providerSetKey: (value) => ipcRenderer.invoke('provider:setKey', value),
+  jevState: () => ipcRenderer.invoke('jev:state'),
+  jevSetKey: (value) => ipcRenderer.invoke('jev:setKey', value),
   settingsGet: () => ipcRenderer.invoke('settings:get'),
   settingsSave: (settings) => ipcRenderer.invoke('settings:save', settings),
   settingsTestEndpoint: (endpoint, provider) => ipcRenderer.invoke('settings:testEndpoint', endpoint, provider),

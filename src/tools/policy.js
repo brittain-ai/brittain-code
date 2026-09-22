@@ -118,8 +118,35 @@ function selectTools(toolDefinitions, names) {
   return toolDefinitions.filter((definition) => names.has(definition.function.name));
 }
 
+// The tools a coding turn reaches for often enough that making the model ask
+// for their schema would cost more round trips than the schemas cost tokens:
+// read, write, edit, run, search, navigate, the two git reads that show what
+// changed, and the one way to ask the user a question. Everything else — the
+// PDF tools, the browser, process control, research, calculate — is real work
+// but not every-turn work, so it is advertised in short and filled in on use.
+//
+// Deliberately a hand-picked list rather than a size threshold: how often a
+// tool is used is not something its schema reveals.
+const HOT_TOOL_NAMES = [
+  'read_file',
+  'write_file',
+  'edit_file',
+  'edit_files',
+  'run_command',
+  'search_files',
+  'browse_files',
+  'get_file_lines',
+  'project_outline',
+  'find_symbol',
+  'find_references',
+  'git_status',
+  'read_git_diff',
+  'ask_user',
+];
+
 function createToolPolicy(toolDefinitions) {
   return {
+    HOT_TOOL_NAMES,
     NETWORK_TOOLS,
     SENSITIVE_TOOLS,
     DESTRUCTIVE_TOOLS,
@@ -140,6 +167,7 @@ function createToolPolicy(toolDefinitions) {
 
 module.exports = {
   CHAT_TOOL_NAMES,
+  HOT_TOOL_NAMES,
   CODER_TOOL_NAMES,
   DESTRUCTIVE_TOOLS,
   NETWORK_TOOLS,

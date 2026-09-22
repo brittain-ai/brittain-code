@@ -108,7 +108,9 @@ test('Code and Chat modes are wired through UI, persistence, and the agent bound
   // MCP access must not be gated behind ONLINE, and the local calculator must
   // remain available when both ONLINE and MCP are off.
   assert.match(main, /const chatTools = \(onlineResearch \? modeTools : offline\(modeTools\)\)\.concat\(mcpDefs\);/);
-  assert.match(main, /return chatTools;/);
+  // Chat mode returns its tools rather than null; abbreviating the payload is a
+  // separate decision that must not drop any of them.
+  assert.match(main, /return index\(chatTools\);/);
   assert.match(main, /Use calculate for repeated values, tables, statistics, matrices, high precision, or verification/);
   assert.match(main, /if \(!activeToolNames\.has\(name\)\)/);
 });

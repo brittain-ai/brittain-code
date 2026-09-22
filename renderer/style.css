@@ -996,6 +996,16 @@ button.mini:disabled {
 /* An empty status should take no room at all, rather than a blank row. */
 #settings-key-status:empty { display: none; }
 
+#settings-jev-key-status {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.75fr) minmax(0, 1.25fr);
+  gap: 10px;
+  margin: 4px 0;
+  font-size: 11px;
+}
+#settings-jev-key-status::before { content: ''; }
+#settings-jev-key-status:empty { display: none; }
+
 /* ---------- MCP integrations settings ---------- */
 .mcp-config-row {
   display: flex;

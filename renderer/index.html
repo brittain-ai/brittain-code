@@ -215,6 +215,19 @@
           <label>Main context <span class="setting-inline"><select id="setting-main-context"><option value="0">Auto (up to 128K)</option><option value="8192">8K</option><option value="16384">16K</option><option value="32768">32K</option><option value="65536">64K</option><option value="131072">128K</option><option value="custom">Custom</option></select><input id="setting-main-context-custom" class="hidden" type="number" min="2048" max="1048576" step="1024" aria-label="Custom main context tokens" /></span></label>
           <label class="check-row"><input id="setting-auto-compact" type="checkbox" /> Auto-compact</label>
           <label>Compact at <input id="setting-compact-threshold" type="number" min="50" max="90" step="5" />%</label>
+          <label>Compaction engine <select id="setting-compaction-engine">
+            <option value="auto">Auto for Brittain 4</option>
+            <option value="native">Native summary</option>
+            <option value="jev-hybrid">Jev hybrid</option>
+            <option value="shadow">Jev shadow test</option>
+          </select></label>
+          <div id="settings-jev-fields">
+            <label>Jev endpoint <input id="setting-jev-endpoint" type="url" spellcheck="false" /></label>
+            <label>Jev model <input id="setting-jev-model" type="text" spellcheck="false" /></label>
+            <label>Jev API key <span class="settings-endpoint-row"><input id="setting-jev-key" type="password" spellcheck="false" autocomplete="off" placeholder="paste to set, blank to remove" /><button type="button" id="settings-save-jev-key">SAVE</button></span></label>
+            <div id="settings-jev-key-status" class="setting-status"></div>
+            <p class="setting-help">Jev receives bounded task text, tool arguments, and tool-result excerpts. Auto uses it only for Brittain 4 when this key is set. Shadow records decisions but does not change model context.</p>
+          </div>
           <label>Keep model loaded <select id="setting-keep-alive"><option value="0">Unload immediately</option><option value="5m">5 minutes</option><option value="30m">30 minutes</option><option value="-1">Keep loaded</option></select></label>
           <p class="setting-help">Context is always capped by the selected model's native limit.</p>
         </section>

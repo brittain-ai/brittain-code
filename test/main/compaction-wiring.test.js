@@ -37,6 +37,16 @@ test('both compaction paths ask for a bounded length rather than leaving it to t
     'summarizing is extraction, not authoring — it should not use the code temperature');
 });
 
+test('Jev uses the native summary when tool selection cannot make the request fit', () => {
+  const main = source('main.js');
+  const start = main.indexOf('async function prepareAgentMessages(');
+  const end = main.indexOf('async function runAgentTurn(', start);
+  const body = main.slice(start, end);
+  assert.match(body, /const native = await compactConversation\(model, signal\)/);
+  assert.ok(body.indexOf('compactConversation(model, signal)') < body.indexOf('Brittain 4 cannot fit this request'),
+    'the app must try both compaction stages before it stops the run');
+});
+
 test('the scoped checkpoint path shares the conversation path summarizer', () => {
   const main = source('main.js');
   const start = main.indexOf('async function compactScopedMessages(');
@@ -55,7 +65,7 @@ test('a compacted record is marked so the next compaction carries it forward', (
   // Both bookkeeping markers are stripped on the way out: compactionRecord so
   // the next compaction can find the prior record, meta so the renderer can
   // tell machine-written messages from dialogue. Neither is the model's business.
-  assert.match(source('main.js'), /excludedFromInference, compactionRecord, meta, pendingRunId, clientRunId, \.\.\.message/,
+  assert.match(source('main.js'), /excludedFromInference, compactionRecord, jevDecision, meta, pendingRunId, clientRunId, \.\.\.message/,
     'the markers must be stripped before messages reach the model');
 });
 
