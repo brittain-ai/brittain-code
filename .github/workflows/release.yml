@@ -19,16 +19,26 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: node scripts/sync-vendor.js --check
       - name: Validate stable release tag
         shell: bash
         run: |
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
           test "${PACKAGE_VERSION#*-}" = "${PACKAGE_VERSION}"
+          test -s "RELEASE_NOTES-${PACKAGE_VERSION}.md"
 
   mac:
     needs: test
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # No Developer ID. afterSign.js does the deep ad-hoc re-sign that keeps
@@ -44,7 +54,9 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Build and publish macOS release
-        run: npx electron-builder --config scripts/release-config.js --mac dmg zip --arm64 --x64 --publish always
+        run: npx electron-builder --config scripts/release-config.js --mac dmg zip --${{ matrix.arch }} --publish always
+      - name: Verify Electron window security
+        run: npx electron scripts/window-security-smoke.js
 
   windows:
     needs: test
@@ -62,6 +74,8 @@ jobs:
       - run: npm ci
       - name: Build and publish Windows release
         run: npx electron-builder --config scripts/release-config.js --win --x64 --publish always
+      - name: Verify Electron window security
+        run: npx electron scripts/window-security-smoke.js
 
   publish:
     needs: [mac, windows]
@@ -69,6 +83,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # No checkout here, so gh cannot infer the repository from a git remote.
+      - uses: actions/checkout@v4
       - name: Publish complete release
-        run: gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --draft=false --latest
+        run: gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --notes-file "RELEASE_NOTES-${GITHUB_REF_NAME#v}.md" --draft=false --latest

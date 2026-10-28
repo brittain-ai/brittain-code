@@ -8,25 +8,56 @@ const DEFAULT_SETTINGS = Object.freeze({
   scoutContextCap: 24_576,
   autoCompact: true,
   compactThreshold: 0.7,
+  // Auto uses Jev for Brittain 4 when a Jev key is configured, and keeps the
+  // native summary path for every other model. Shadow scores and records Jev
+  // decisions without applying them to inference.
+  compactionEngine: 'auto',
+  jevEndpoint: 'https://api.typesafe.ai/v1/systemone',
+  jevModel: 'jev-latest',
   keepAlive: '5m',
   codeTemperature: 0.3,
   chatTemperature: 0.6,
   defaultMode: 'last',
+  // Which protocol the endpoint speaks. 'ollama' is the local default;
+  // 'openai' covers every OpenAI-compatible provider — OpenRouter, Z.AI, Groq,
+  // DeepSeek — with the base URL going in inferenceEndpoint as documented.
+  //
+  // Chosen rather than sniffed: this decides whether a conversation leaves the
+  // machine, which is not a question to answer by guessing at a URL.
+  provider: 'ollama',
   codeModel: '',
   chatModel: '',
+  // The model last run from the UI. Not a preference anyone edits — it exists
+  // so callers with no window (the daemon, a trigger, the Discord bridge) can
+  // inherit whatever is selected in the app instead of failing with "select a
+  // model first" while a model is plainly selected.
+  lastModel: '',
   coderModel: '',
   scoutModel: '',
   codeThink: false,
   chatThink: false,
   sidebarOpen: true,
   autoApprove: false,
+  // Which named autonomy policy a run uses. Empty means "derive it from
+  // autoApprove", which is how an existing install keeps its behaviour on
+  // upgrade: checked lands on trusted, unchecked on supervised.
+  autonomyPolicy: '',
   autoBranch: false,
   reviewMode: false,
   mcpAutoApprove: false,
+  onlineAutoApprove: false,
   globalCodeInstructions: '',
   globalChatInstructions: '',
   maxAgentSteps: 50,
   defaultLoopIterations: 8,
+  // Whether to abbreviate the tool payload: send the every-turn tools in full
+  // and the rest as name, one-line summary, and required arguments, filling in
+  // a full schema the first time one is actually called.
+  //
+  // 'auto' turns it on only for a small context window, where the schemas are a
+  // large share of the budget. A big local model keeps the whole payload, since
+  // there the round trip a stub can cost is worth more than the tokens it saves.
+  toolIndex: 'auto',
 });
 
 function clampNumber(value, fallback, min, max) {
@@ -42,6 +73,17 @@ function cleanText(value, maxLength) {
   return String(value || '').replace(/\r\n?/g, '\n').trim().slice(0, maxLength);
 }
 
+// A base URL, which for a cloud provider includes a path.
+//
+// This originally allowed only an origin, because Ollama's endpoint is a host
+// and a port and the client appends /api/chat itself. Every OpenAI-compatible
+// provider documents a base that carries a path — https://openrouter.ai/api/v1,
+// https://api.z.ai/api/paas/v4 — so refusing paths made those endpoints
+// impossible to enter at all.
+//
+// What stays refused is anything that is not addressing: credentials, a query
+// string, a fragment. Those are either a mistake or a key about to be stored in
+// the wrong place.
 function normalizeEndpoint(value) {
   const raw = String(value || DEFAULT_SETTINGS.inferenceEndpoint).trim();
   let parsed;
@@ -49,16 +91,19 @@ function normalizeEndpoint(value) {
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Inference endpoint must use http:// or https://.');
   if (parsed.username || parsed.password) throw new Error('Put no credentials in the inference endpoint URL.');
   if (!parsed.hostname) throw new Error('Inference endpoint needs a hostname.');
-  if (parsed.pathname !== '/' || parsed.search || parsed.hash) {
-    throw new Error('Inference endpoint must contain only protocol, host, and optional port.');
+  if (parsed.search || parsed.hash) {
+    throw new Error('Inference endpoint takes a base URL only — no query string or fragment.');
   }
-  return parsed.origin;
+  // A trailing slash is dropped so the transports can append their own path
+  // without producing a doubled separator.
+  const path = parsed.pathname.replace(/\/+$/, '');
+  return parsed.origin + path;
 }
 
 function normalizeContextCap(value, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number) || number === 0) return number === 0 ? 0 : fallback;
-  return clampInteger(number, fallback, 2_048, 262_144);
+  return clampInteger(number, fallback, 2_048, 1_048_576);
 }
 
 function normalizeSettings(input = {}) {
@@ -70,11 +115,18 @@ function normalizeSettings(input = {}) {
     scoutContextCap: normalizeContextCap(merged.scoutContextCap, DEFAULT_SETTINGS.scoutContextCap),
     autoCompact: !!merged.autoCompact,
     compactThreshold: clampNumber(merged.compactThreshold, DEFAULT_SETTINGS.compactThreshold, 0.5, 0.9),
+    compactionEngine: ['auto', 'native', 'jev-hybrid', 'shadow'].includes(merged.compactionEngine)
+      ? merged.compactionEngine
+      : DEFAULT_SETTINGS.compactionEngine,
+    jevEndpoint: normalizeEndpoint(merged.jevEndpoint || DEFAULT_SETTINGS.jevEndpoint),
+    jevModel: cleanText(merged.jevModel || DEFAULT_SETTINGS.jevModel, 200),
     keepAlive: ['0', '5m', '30m', '-1'].includes(String(merged.keepAlive)) ? String(merged.keepAlive) : DEFAULT_SETTINGS.keepAlive,
     codeTemperature: clampNumber(merged.codeTemperature, DEFAULT_SETTINGS.codeTemperature, 0, 1.5),
     chatTemperature: clampNumber(merged.chatTemperature, DEFAULT_SETTINGS.chatTemperature, 0, 1.5),
     defaultMode: ['last', 'code', 'chat'].includes(merged.defaultMode) ? merged.defaultMode : DEFAULT_SETTINGS.defaultMode,
+    provider: merged.provider === 'openai' ? 'openai' : 'ollama',
     codeModel: cleanText(merged.codeModel, 200),
+    lastModel: cleanText(merged.lastModel, 200),
     chatModel: cleanText(merged.chatModel, 200),
     coderModel: cleanText(merged.coderModel, 200),
     scoutModel: cleanText(merged.scoutModel, 200),
@@ -82,13 +134,16 @@ function normalizeSettings(input = {}) {
     chatThink: !!merged.chatThink,
     sidebarOpen: !!merged.sidebarOpen,
     autoApprove: !!merged.autoApprove,
+    autonomyPolicy: cleanText(merged.autonomyPolicy, 80),
     autoBranch: !!merged.autoBranch,
     reviewMode: !!merged.reviewMode,
     mcpAutoApprove: !!merged.mcpAutoApprove,
+    onlineAutoApprove: !!merged.onlineAutoApprove,
     globalCodeInstructions: cleanText(merged.globalCodeInstructions, 12_000),
     globalChatInstructions: cleanText(merged.globalChatInstructions, 12_000),
     maxAgentSteps: clampInteger(merged.maxAgentSteps, DEFAULT_SETTINGS.maxAgentSteps, 5, 100),
     defaultLoopIterations: clampInteger(merged.defaultLoopIterations, DEFAULT_SETTINGS.defaultLoopIterations, 1, 50),
+    toolIndex: ['auto', 'on', 'off'].includes(merged.toolIndex) ? merged.toolIndex : DEFAULT_SETTINGS.toolIndex,
   };
 }
 

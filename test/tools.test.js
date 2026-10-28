@@ -152,13 +152,69 @@ test('semantic navigation outlines definitions and finds bounded references', as
   assert.match(invalid, /one identifier/);
 });
 
-test('folder-free Chat mode receives only conversation and research tools', () => {
+test('folder-free Chat mode receives conversation, memory, calculator, and research tools', () => {
   const names = new Set(CHAT_TOOLS.map((definition) => definition.function.name));
   assert.deepEqual(names, CHAT_TOOL_NAMES);
-  assert.deepEqual([...names].sort(), ['ask_user', 'web_fetch', 'web_search']);
+  assert.deepEqual([...names].sort(), [
+    'ask_user', 'calculate', 'pdf_fill_form', 'pdf_info', 'pdf_merge', 'pdf_pages', 'pdf_render', 'pdf_stamp',
+    'remember', 'web_fetch', 'web_search',
+  ]);
+  // Chat still has no filesystem. The PDF tools are the one exception and they
+  // reach only files the person attached this turn — never a path by name.
   assert.equal(names.has('read_file'), false);
+  assert.equal(names.has('write_file'), false);
   assert.equal(names.has('run_command'), false);
-  assert.equal(names.has('remember'), false);
+  assert.equal(names.has('remember'), true);
+});
+
+test('folder-free Chat memory is user-wide and does not require a project', async (t) => {
+  const userData = tempProject();
+  t.after(() => fs.rmSync(userData, { recursive: true, force: true }));
+  initTools(userData);
+
+  const result = await executeTool('remember', { fact: 'Prefer concise answers.' }, null);
+  assert.match(result, /folder-free Chat mode/);
+  assert.match(readMemory(null), /Prefer concise answers/);
+  assert.equal(memoryPath(null), path.join(userData, 'memory', 'chat.md'));
+});
+
+test('calculate evaluates scalar, table, matrix, and high-precision expressions', async () => {
+  const scalar = JSON.parse(await executeTool('calculate', {
+    calculations: [{ id: 'trig', expression: 'sin(pi / 4)' }],
+    precision: 20,
+  }));
+  assert.equal(scalar.precision, 20);
+  assert.match(scalar.calculations[0].rows[0].result, /^0\.7071067811865475244/);
+
+  const table = JSON.parse(await executeTool('calculate', {
+    calculations: [{
+      id: 'limit',
+      expression: '(x - 4) / (x^2 - 3*x - 4)',
+      variables: { x: [3.9, 3.99, 4.01, 4.1] },
+    }],
+    precision: 12,
+  }));
+  assert.deepEqual(table.calculations[0].rows.map((row) => row.variables.x), ['3.9', '3.99', '4.01', '4.1']);
+  assert.deepEqual(table.calculations[0].rows.map((row) => row.result), [
+    '0.204081632653', '0.200400801603', '0.199600798403', '0.196078431373',
+  ]);
+
+  const matrix = JSON.parse(await executeTool('calculate', {
+    calculations: [{ expression: '[1, 2; 3, 4] * [5; 6]' }],
+  }));
+  assert.deepEqual(matrix.calculations[0].rows[0].result, [['17'], ['39']]);
+});
+
+test('calculate rejects code-like expressions and bounds batch input', async () => {
+  assert.match(await executeTool('calculate', {
+    calculations: [{ expression: 'x = 2' }],
+  }), /AssignmentNode is not allowed/);
+  assert.match(await executeTool('calculate', {
+    calculations: [{ expression: 'createUnit("unsafe")' }],
+  }), /function "createUnit" is not allowed/);
+  assert.match(await executeTool('calculate', {
+    calculations: [{ expression: 'sqrt(x)', variables: { x: [] } }],
+  }), /empty value array/);
 });
 
 test('git_status and read_git_diff distinguish staged and unstaged changes', async (t) => {

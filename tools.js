@@ -15,18 +15,31 @@ const net = require('net');
 const dns = require('dns').promises;
 const { execFile, exec, spawn } = require('child_process');
 const { createToolPolicy } = require('./src/tools/policy');
+const workspace = require('./src/main/workspace');
+const pdf = require('./src/tools/pdf');
+const attachedFiles = require('./src/tools/attached-files');
+const renderedPages = require('./src/tools/rendered-pages');
 const {
   findReferences,
   findSymbol,
   projectOutline,
 } = require('./src/tools/semantic-navigation');
 const { applyUnifiedPatch } = require('./src/tools/apply-patch');
+const { calculate } = require('./src/tools/calculator');
 
 const MAX_TOOL_OUTPUT = 40_000;   // chars of tool output fed back to the model
 
 let userDataDir = null;
 function initTools(dir) {
   userDataDir = dir;
+}
+
+// OS-level containment for shell commands, set by main.js for the duration of
+// a sandboxed unattended run and cleared after (see src/main/sandbox.js).
+// null = run commands unconfined, exactly as before.
+let commandSandbox = null;
+function setCommandSandbox(wrapper) {
+  commandSandbox = typeof wrapper === 'function' ? wrapper : null;
 }
 
 // Background processes started by the agent are kept in an in-memory registry
@@ -66,9 +79,9 @@ function stopAllManagedProcesses() {
 }
 
 // ---------- persistent memory ----------
-// Plain-text lessons saved by `remember`, scoped to the selected project while
-// living outside its repository. The canonical project path is hashed so app
-// data stays filename-safe; projects.json preserves a human-readable mapping.
+// Plain-text lessons saved by `remember`. Code mode scopes them to the selected
+// project; folder-free Chat mode uses one user-wide file. Project paths are
+// hashed so app data stays filename-safe; projects.json keeps readable names.
 function canonicalProjectPath(cwd) {
   if (!cwd) throw new Error('A working directory is required for project memory.');
   try { return fs.realpathSync(cwd); } catch { return path.resolve(cwd); }
@@ -83,6 +96,13 @@ function memoryDir() {
 }
 
 function memoryPath(cwd) {
+  // Chat mode is deliberately folder-free. Its remembered lessons are
+  // user-wide instead of being attached to a project that does not exist.
+  if (!cwd) return path.join(memoryDir(), 'chat.md');
+  // A project that opted into the in-repo workspace keeps its memory there,
+  // where it shows up in diffs; everything else stays in app data. The
+  // presence of .brittain/ IS the opt-in — created only by an explicit init.
+  if (workspace.hasWorkspace(cwd)) return workspace.memoryFile(cwd);
   return path.join(memoryDir(), 'projects', projectMemoryId(cwd) + '.md');
 }
 
@@ -91,7 +111,6 @@ function legacyMemoryPath() {
 }
 
 function readMemory(cwd) {
-  if (!cwd) return '';
   try { return fs.readFileSync(memoryPath(cwd), 'utf8'); } catch { return ''; }
 }
 
@@ -118,24 +137,128 @@ function registerProjectMemory(cwd) {
 }
 
 // ---------- tools ----------
-function resolveInside(cwd, p) {
-  const root = fs.realpathSync(cwd);
-  const abs = path.resolve(root, p || '.');
-  const isInside = (candidate) => {
-    const rel = path.relative(root, candidate);
-    return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
-  };
-  if (!isInside(abs)) throw new Error(`Path escapes the working directory: ${p}`);
 
-  // Lexical checks alone can be bypassed through a symlink inside the project.
-  // Resolve the nearest existing ancestor so new files are safe as well.
-  let existing = abs;
+// Directories outside the project that the active policy grants, supplied by
+// main.js as a function rather than a value. A run's policy can change between
+// turns, and a stale copy here would either over- or under-grant; asking each
+// time means there is no lifecycle to get wrong. Absent provider = project only.
+let rootProvider = null;
+// Whether the model running this turn can see images. main.js owns the answer;
+// without it pdf_render would spend a context window rendering pages for a
+// model that will only be told an image was attached.
+let visionCheck = async () => false;
+function setVisionCheck(fn) {
+  visionCheck = typeof fn === 'function' ? fn : async () => false;
+}
+
+function setRootProvider(fn) {
+  rootProvider = typeof fn === 'function' ? fn : null;
+}
+
+function grantedRoots() {
+  try {
+    return (rootProvider ? rootProvider() : []).filter(Boolean);
+  } catch {
+    // A provider that throws grants nothing, which is the safe direction.
+    return [];
+  }
+}
+
+// Every root a path may legitimately live under: the project, plus whatever the
+// policy granted. A granted root that no longer exists grants nothing rather
+// than throwing — directories come and go, and that must not break a run.
+function activeRoots(cwd) {
+  const roots = [fs.realpathSync(cwd)];
+  for (const extra of grantedRoots()) {
+    try {
+      const real = fs.realpathSync(extra);
+      if (!roots.includes(real)) roots.push(real);
+    } catch {}
+  }
+  return roots;
+}
+
+function containingRoot(roots, candidate) {
+  let best = '';
+  for (const root of roots) {
+    const rel = path.relative(root, candidate);
+    const inside = rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
+    if (inside && root.length > best.length) best = root;
+  }
+  return best;
+}
+
+// The real location a path refers to, including a tail that does not exist yet.
+//
+// Containment cannot be decided lexically. A symlink inside the project can
+// point anywhere, and on macOS an ordinary path like /var/... is itself a
+// symlink to /private/var/..., so comparing raw strings both lets escapes
+// through and rejects legitimate paths. Resolving the nearest existing ancestor
+// and re-attaching the remainder settles both cases at once, and keeps new
+// files safe rather than only existing ones.
+function canonicalize(target) {
+  let existing = target;
   while (!fs.existsSync(existing)) {
     const parent = path.dirname(existing);
     if (parent === existing) break;
     existing = parent;
   }
-  if (!isInside(fs.realpathSync(existing))) throw new Error(`Path escapes the working directory through a symlink: ${p}`);
+  try {
+    return path.join(fs.realpathSync(existing), path.relative(existing, target));
+  } catch {
+    return target;
+  }
+}
+
+// A PDF path may name an attachment as well as a file in the project. In chat
+// the attachment list is the only door — see src/tools/attached-files.js.
+function pdfInput(cwd, requested) {
+  return attachedFiles.resolveInput(requested, (p) => resolveInside(cwd, p));
+}
+
+// In a restricted run this is the working copy for `source`, so successive
+// edits build up in one file instead of each overwriting the last.
+function pdfOutput(cwd, requested, source) {
+  return attachedFiles.resolveOutput(requested, (p) => resolveForWrite(cwd, p), source);
+}
+
+// A tool that quietly does something other than what it was asked costs the
+// model a round trip to discover it, and it spent six of them working this out
+// by experiment. So when the output location is not the one requested, the
+// result says so and says why.
+function pdfNote(requested, actual) {
+  if (!attachedFiles.isRestricted()) return '';
+  const coerced = requested && path.resolve(requested) !== path.resolve(actual || '');
+  return '\n\nChat edits accumulate in this one file beside the original, and the'
+    + ' attachment itself is never modified. Pass it to the next call by the'
+    + ' attachment\'s name to keep building on it.'
+    + (coerced ? ` The requested output "${requested}" was not used: chat cannot write elsewhere.` : '');
+}
+
+function resolveInside(cwd, p) {
+  const roots = activeRoots(cwd);
+  // Relative paths still mean "in the project" — a granted root is reachable by
+  // naming it, never by accident.
+  const abs = path.resolve(roots[0], p || '.');
+  const where = roots.length > 1
+    ? `the working directory or a granted root (${roots.slice(1).join(', ')})`
+    : 'the working directory';
+
+  // Two different failures, worth telling apart. A path that never looked
+  // contained is a mistake; one that looked fine and resolved elsewhere went
+  // through a symlink, and saying so is the difference between "typo" and
+  // "something in this project points outside it".
+  //
+  // The lexical check cannot stand alone in either direction: on macOS an
+  // ordinary /var/... path is itself a symlink to /private/var/..., so it
+  // reads as outside while being perfectly legitimate. Only the canonical
+  // check decides; the lexical one just picks the wording.
+  if (!containingRoot(roots, canonicalize(abs))) {
+    const lookedInside = !!containingRoot(roots, abs);
+    throw new Error(lookedInside
+      ? `Path escapes ${where} through a symlink: ${p}`
+      : `Path escapes ${where}: ${p}`);
+  }
   return abs;
 }
 
@@ -285,7 +408,13 @@ function loadProtectedGlobs(cwd) {
 // tool that mutates the filesystem.
 function resolveForWrite(cwd, p) {
   const abs = resolveInside(cwd, p);
-  const rel = path.relative(fs.realpathSync(cwd), abs).split(path.sep).join('/');
+  // Match protected globs against the path within whichever root contains it.
+  // Measuring from cwd would produce "../../notes/x.md" for a granted root, and
+  // a leading ../ stops every project-relative pattern from matching.
+  const roots = activeRoots(cwd);
+  const real = canonicalize(abs);
+  const base = containingRoot(roots, real) || roots[0];
+  const rel = path.relative(base, real).split(path.sep).join('/');
   for (const glob of loadProtectedGlobs(cwd)) {
     const re = globToRegex(glob);
     if (re.test(rel) || re.test(path.basename(rel))) {
@@ -603,12 +732,150 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'calculate',
+      description: 'Evaluate safe, read-only math expressions locally. Use for repeated arithmetic, limit tables, trigonometry, statistics, matrices, or precision checks. Give scalar variables for one result or equal-length arrays for a row-by-row table. Angles use radians unless the expression converts them. Never use a browser only to do math.',
+      parameters: {
+        type: 'object',
+        properties: {
+          calculations: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            description: 'One or more independent calculations.',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Optional short label used to match the result.' },
+                expression: { type: 'string', description: 'Math expression, such as "sin(pi / 4)" or "(x - 4) / (x^2 - 3*x - 4)".' },
+                variables: {
+                  type: 'object',
+                  description: 'Named scalar values or equal-length value arrays. Arrays create a row-by-row result table.',
+                  additionalProperties: {
+                    oneOf: [
+                      { type: 'number' },
+                      { type: 'string' },
+                      { type: 'array', minItems: 1, maxItems: 50, items: { oneOf: [{ type: 'number' }, { type: 'string' }] } },
+                    ],
+                  },
+                },
+              },
+              required: ['expression'],
+            },
+          },
+          precision: { type: 'integer', minimum: 2, maximum: 64, description: 'Significant digits used for calculation and display (default: 14).' },
+        },
+        required: ['calculations'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'read_file',
       description: 'Read a text file. Returns the file contents.',
       parameters: {
         type: 'object',
         properties: { path: { type: 'string', description: 'File path relative to the working directory' } },
         required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_info',
+      description: 'Inspect a PDF: page count, page sizes, rotation, metadata, and the list of fillable form fields with their types and current values. Call this before pdf_fill_form so you fill fields that exist.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Path to the PDF' } },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_render',
+      description: 'Render pages of a PDF as images and look at them. Use this when a PDF\'s extracted text is missing, garbled, or does not match what the document plainly contains, and when you need to see layout — where the blank lines and boxes actually are — before stamping onto a page. Requires a model that can see images.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to the PDF' },
+          pages: { type: 'string', description: 'Pages to render, e.g. "1", "2-4". Defaults to the first page. Each page costs a lot of context, so ask for the fewest you need.' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_fill_form',
+      description: 'Set values on a PDF form\'s fields. Field names must match pdf_info exactly. Writes to a new "-filled" file beside the source unless output says otherwise. Only works on AcroForm PDFs; XFA forms cannot be filled — use pdf_stamp for those.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to the PDF' },
+          values: { type: 'object', description: 'Field name to value. Checkboxes take true/false; dropdowns and radio groups take one of their listed options.' },
+          flatten: { type: 'boolean', description: 'Bake the values in so they are no longer editable. Cannot be undone. Default false.' },
+          output: { type: 'string', description: 'Where to write. Defaults to <name>-filled.pdf beside the source.' },
+        },
+        required: ['path', 'values'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_stamp',
+      description: 'Draw text or a PNG/JPEG image at a position on one page. Text may contain newlines and renders as multiple lines — this is how you sign a PDF or annotate one that has no form fields. Coordinates are in points from the TOP-LEFT of the page; pdf_info reports each page size.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to the PDF' },
+          page: { type: 'number', description: 'Page number, 1-based. Default 1.' },
+          x: { type: 'number', description: 'Points from the left edge' },
+          y: { type: 'number', description: 'Points from the top edge' },
+          text: { type: 'string', description: 'Text to draw. Provide this or image.' },
+          image: { type: 'string', description: 'Path to a PNG or JPEG to draw, e.g. a signature. Provide this or text.' },
+          size: { type: 'number', description: 'Font size in points for text, or drawn width in points for an image. Default 12.' },
+          opacity: { type: 'number', description: '0 to 1. Default 1.' },
+          output: { type: 'string', description: 'Where to write. Defaults to <name>-stamped.pdf beside the source.' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_pages',
+      description: 'Rearrange pages: rotate, delete, extract a subset, or reorder. Pages are given as a 1-based list or ranges like "1-3,7,12-".',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to the PDF' },
+          operation: { type: 'string', enum: ['rotate', 'delete', 'extract', 'reorder'], description: 'What to do. reorder writes the pages in exactly the order given.' },
+          pages: { type: 'string', description: 'Pages to act on, e.g. "1-3,7" or "all". For reorder this is the new order.' },
+          degrees: { type: 'number', description: 'Rotation in degrees, for operation=rotate. Default 90.' },
+          output: { type: 'string', description: 'Where to write. Defaults to a suffixed name beside the source.' },
+        },
+        required: ['path', 'operation', 'pages'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_merge',
+      description: 'Combine two or more PDFs into one, in the order given.',
+      parameters: {
+        type: 'object',
+        properties: {
+          paths: { type: 'array', items: { type: 'string' }, description: 'PDFs to merge, in order. At least two.' },
+          output: { type: 'string', description: 'Where to write. Defaults to <first>-merged.pdf.' },
+        },
+        required: ['paths'],
       },
     },
   },
@@ -870,7 +1137,7 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'remember',
-      description: 'Save a short reusable lesson to persistent memory for the current project. It will be available in future chats using the same working directory. Use when the user corrects you, when you discover a project convention, or when you make a mistake worth avoiding next time. One concise sentence per fact.',
+      description: 'Save a short reusable lesson to persistent memory. In Code mode it belongs to the current project. In folder-free Chat mode it is user-wide. Use when the user corrects you, when you discover a lasting preference or convention, or when you make a mistake worth avoiding next time. One concise sentence per fact.',
       parameters: {
         type: 'object',
         properties: {
@@ -1347,6 +1614,8 @@ async function executeTool(name, args, cwd) {
   // futility tracking must see every call so any non-write action resets it
   const futilityNote = trackRewrite(name, name === 'write_file' && args?.path ? resolveInside(cwd, args.path) : '');
   switch (name) {
+    case 'calculate':
+      return calculate(args);
     case 'get_git_graph': {
       return gitRun(['log', '--graph', '--oneline', '--all', '--no-color'], cwd).then((res) => (res.ok ? truncate(res.out) : `Error: ${res.err}`));
     }
@@ -1356,6 +1625,46 @@ async function executeTool(name, args, cwd) {
       if (stat.size > 2_000_000) return `Error: file too large (${stat.size} bytes)`;
       return truncate(fs.readFileSync(p, 'utf8'));
     }
+    case 'pdf_info':
+      return await pdf.info(pdfInput(cwd, args.path));
+
+    case 'pdf_render':
+      return await pdf.render(pdfInput(cwd, args.path), args.pages, {
+        queue: renderedPages.queue,
+        canSee: visionCheck,
+      });
+
+    case 'pdf_fill_form': {
+      const source = pdfInput(cwd, args.path);
+      const out = pdfOutput(cwd, args.output, source);
+      return (await pdf.fillForm(source, args.values, {
+        flatten: !!args.flatten,
+        output: out,
+      })) + pdfNote(args.output, out);
+    }
+
+    case 'pdf_stamp': {
+      const source = pdfInput(cwd, args.path);
+      const out = pdfOutput(cwd, args.output, source);
+      return (await pdf.stamp(source, {
+        ...args,
+        image: args.image ? pdfInput(cwd, args.image) : '',
+        output: out,
+      })) + pdfNote(args.output, out);
+    }
+
+    case 'pdf_pages': {
+      const source = pdfInput(cwd, args.path);
+      const out = pdfOutput(cwd, args.output, source);
+      return (await pdf.pages(source, { ...args, output: out })) + pdfNote(args.output, out);
+    }
+
+    case 'pdf_merge': {
+      const sources = (args.paths || []).map((file) => pdfInput(cwd, file));
+      const out = pdfOutput(cwd, args.output, sources[0]);
+      return (await pdf.merge(sources, out)) + pdfNote(args.output, out);
+    }
+
     case 'write_file': {
       const p = resolveForWrite(cwd, args.path);
       fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -1429,8 +1738,12 @@ async function executeTool(name, args, cwd) {
       return truncate(lines.join('\n'));
     }
     case 'run_command': {
+      const argv = commandSandbox ? commandSandbox(String(args.command), fs.realpathSync(cwd)) : null;
+      const execute = argv
+        ? (callback) => execFile(argv[0], argv.slice(1), { cwd, timeout: 60_000, maxBuffer: 4_000_000 }, callback)
+        : (callback) => exec(args.command, { cwd, timeout: 60_000, maxBuffer: 4_000_000 }, callback);
       return new Promise((resolve) => {
-        exec(args.command, { cwd, timeout: 60_000, maxBuffer: 4_000_000 }, (err, stdout, stderr) => {
+        execute((err, stdout, stderr) => {
           let out = '';
           if (stdout) out += stdout;
           if (stderr) out += (out ? '\n--- stderr ---\n' : '') + stderr;
@@ -1645,12 +1958,21 @@ async function executeTool(name, args, cwd) {
     case 'remember': {
       const fact = String(args.fact || '').trim().replace(/\s*\n+\s*/g, ' ');
       if (!fact) return 'Error: fact must not be empty.';
-      if (readMemory(cwd).includes(fact)) return 'Already remembered for this project.';
+      const scope = cwd ? 'this project' : 'folder-free Chat mode';
+      if (readMemory(cwd).includes(fact)) return `Already remembered for ${scope}.`;
       const target = memoryPath(cwd);
+      // In-repo memory is potentially committed and pushed. A remembered
+      // credential there is a published credential, so anything key-shaped is
+      // refused rather than written.
+      if (cwd && workspace.hasWorkspace(cwd) && workspace.looksLikeSecret(fact)) {
+        return 'Error: this fact looks like a credential or key, and project memory lives inside the repository (.brittain/MEMORY.md). Not saved. Rephrase without the secret value.';
+      }
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.appendFileSync(target, '- ' + fact + '\n', 'utf8');
-      registerProjectMemory(cwd);
-      return 'Remembered for this project. This will be available in future chats that use the same directory.';
+      if (cwd) registerProjectMemory(cwd);
+      return cwd
+        ? 'Remembered for this project. This will be available in future chats that use the same directory.'
+        : 'Remembered for folder-free Chat mode. This will be available in future Chat sessions.';
     }
     case 'append_file': {
       const p = resolveForWrite(cwd, args.path);
@@ -2309,6 +2631,7 @@ function gitRun(args, cwd, env) {
 }
 
 const {
+  HOT_TOOL_NAMES,
   NETWORK_TOOLS,
   SENSITIVE_TOOLS,
   DESTRUCTIVE_TOOLS,
@@ -2325,7 +2648,13 @@ const {
 
 module.exports = {
   initTools,
+  setCommandSandbox,
+  setRootProvider,
+  setVisionCheck,
+  setAttachedFiles: attachedFiles.setAttachedFiles,
+  takeRenderedPages: renderedPages.take,
   TOOL_DEFS,
+  HOT_TOOL_NAMES,
   RISKY_TOOLS,
   SUBAGENT_TOOLS,
   SUBAGENT_TOOL_NAMES,

@@ -19,7 +19,7 @@ Ollama must be running (`ollama serve`, or the menu bar app).
 |---|---|
 | `npm run dist` | Local macOS `.dmg` and `.zip` without production updates |
 | `npm run dist:win` | Windows x64 NSIS installer |
-| `npm run dist:all` | both |
+| Release workflow | macOS ARM64, macOS Intel, and Windows x64 on separate matching runners |
 | `npm run deploy` | macOS: build and copy straight into /Applications |
 
 On macOS the standalone app lands in `dist/mac-arm64/Brittain Code.app`; drag it into Applications or the Dock to launch it without a terminal. Local builds use an ad-hoc signature, so the first launch can need the usual right-click → Open. Local Windows builds can show the SmartScreen "More info" → "Run anyway" action.
@@ -34,16 +34,138 @@ The built app is a snapshot of the code at build time — editing `main.js` or t
 
 1. Choose **CODE** for project work or **CHAT** for folder-free conversation and research.
 2. Pick a model from the dropdown. Models that support tool calling work best — **qwen3.6:27b** and **gemma4:26b** are the strongest for agent tasks, **qwen3:8b** and **gemma4:latest** are fast fallbacks. qwen3-coder:30b sometimes emits malformed tool calls; tiny models (qwen2.5-coder:1.5b) are chat-only.
-3. In Code mode, click **DIR** and choose the project folder the agent should work in. Chat mode deliberately has no directory or project tools.
+3. In Code mode, choose the project folder below the model selector. Chat mode has no project file access.
 4. Type a task or question and hit Enter.
 
-The agent can inspect and edit files, search source and locally installed documentation, run allowlisted project checks, inspect Git state, manage local development processes, verify loopback HTTP servers, and run shell commands. `run_project_check` discovers npm-compatible scripts, CMake configure/build/CTest flows, Cargo, Go, Python/pytest, and safe Make targets; every command runs without a shell. File tools are confined to the selected project directory. It asks before writes, commands, and other risky operations. **AUTO-APPROVE** can make ordinary risky tools unattended, but online requests and sensitive reads always require explicit approval.
+The interface follows the Brittain web chat layout. The sidebar contains **New chat**, conversation search, and **Settings**. Search finds chat titles, project folders, and model names. The model selector stays at the top of the conversation. In Code mode, the row below it contains the folder, Git actions, and active approval policy.
+
+**Run options** beside the message field contains THINK, web research, the approval policy, automatic branching, and review mode. Web research still requires confirmation before it is enabled. Context use appears below the message field. **Run details** shows elapsed time, tool calls, speed, and app version.
+
+The agent can inspect and edit files, search source and locally installed documentation, run allowlisted project checks, inspect Git state, manage local development processes, verify loopback HTTP servers, and run shell commands. `run_project_check` discovers npm-compatible scripts, CMake configure/build/CTest flows, Cargo, Go, Python/pytest, and safe Make targets; every command runs without a shell. File tools are confined to the selected project directory. It asks before writes, commands, and other risky operations. The **AUTONOMY** dial sets how much a run may do without asking: *Supervised* prompts before every risky call, *Guarded* lets reads and project checks through but still asks before writes and commands, and *Trusted* runs ordinary risky tools unattended. Whatever the setting, destructive operations, sensitive reads, and external MCP tools always require explicit approval, and online requests need both the ONLINE switch and a policy that permits them. Custom policies can be defined in `autonomy.json` in the application-data directory; built-in ones cannot be overridden.
 
 If Ollama rejects malformed tool-call JSON, Brittain Code discards that call and retries generation once with strict formatting and THINK disabled. A second rejection stops safely with a concise model-format error; malformed arguments are never reconstructed or executed.
+
+### What a saved session records
+
+Alongside the transcript, a saved chat records the models it used, the working directory, and whether the session ever ran with **online research enabled** — shown as an `ONLINE` marker in the session list. That provenance flag is a latch over the whole session rather than the state of the switch when the chat happened to be saved: research done an hour ago is still in the transcript after the toggle goes off, so a snapshot would file a session that plainly went online as local. It is stamped in the main process from the runs themselves, not from the sender.
+
+The current ONLINE switch is stored separately. A chat saved with the switch off reopens offline, even when its provenance marker says that it used research earlier. A chat saved with the switch on restores that state without another prompt. Brand-new and older chats always start with the switch off.
+
+### Cloud models
+
+Inference speaks two protocols. `ollama` is the default: the endpoint is a local Ollama-compatible host and nothing leaves the machine. `openai` covers every OpenAI-compatible provider — OpenRouter, Z.AI, Groq, DeepSeek — with the base URL going in the same endpoint setting exactly as the provider documents it (`https://openrouter.ai/api/v1`). Provider, key and cost rates all live in Settings beside that endpoint; `/provider` reports what is configured without changing it.
+
+The provider is chosen rather than sniffed from the URL, because it decides whether a conversation leaves your machine and that is not a question to answer by guessing. An unrecognised value stays local.
+
+The key is kept in `credentials.json` rather than `settings.json`, encrypted against the OS keychain where one is available and mode `0600` regardless; when no encrypted storage exists the app says so rather than implying protection it does not have. It is never sent to the interface — `/provider` shows only whether a key is set and its first and last few characters.
+
+Worth being clear about what changes: on a cloud provider **every message is sent to that endpoint**, including the contents of files the agent reads. With policy `roots` or MCP servers configured, that can reach well beyond the project folder. The sensitive-read invariant still refuses `.env` files and keys, and online research remains a separate switch, but the model itself now sees everything else. Prices come from the provider's own model listing rather than being typed in, so each turn ends with a quiet line showing what it cost and the tokens behind it, and `/cost` reports the running total for the conversation. Both appear only on a cloud provider: a local model has no bill, `/cost` is not offered in the command list, and a cloud model whose provider publishes no rates is reported as unpriced rather than as free — an unknown cost and a zero cost are different claims.
+
+### Editing PDFs
+
+Code mode has five PDF tools. `pdf_info` reports pages, sizes, and the form
+fields with their types and current values — call it first, since filling a
+field that does not exist is an error rather than a silent skip. `pdf_fill_form`
+sets AcroForm values, with an opt-in `flatten` to bake them in. `pdf_stamp`
+draws text or a PNG/JPEG at a position, measured in points from the top-left,
+which is how a signature gets onto a page and the only way to add content to a
+document with no form. `pdf_pages` rotates, deletes, extracts, or reorders using
+ranges like `1-3,7,12-`. `pdf_merge` concatenates. `pdf_render` renders pages as
+images and puts them in front of the model — for a document whose text layer is
+missing or garbled, and for seeing where the blank lines actually are before
+stamping onto them, since coordinates derived from a page size are guesses until
+something looks at the page. It needs a vision-capable model and says so plainly
+when the selected one cannot see, rather than rendering pages nothing will read.
+
+Every one of them that writes does so to a new file beside the source by default — a PDF is
+usually the only copy of the thing and has no diff to recover from — so
+overwriting the original means naming it as `output` deliberately. All four
+writers are classified risky and go through the same approval gate as
+`write_file`.
+
+Chat can use them too, which is the one exception to chat having no
+filesystem. It reaches only the files you attached to the conversation — by the
+name shown in the composer, and they stay reachable on later turns without
+re-attaching — and every edit lands in a single `-edited` file beside the
+original, which is never modified. Naming the attachment again reads that
+in-progress file rather than the pristine one, so a seven-page form can be
+filled a page at a time, across as many turns as it takes, and the work builds
+up instead of each pass erasing the last. A pasted file has no path on disk and
+stays read-only reference material.
+
+Two limits worth knowing. Body text cannot be edited: a PDF stores glyphs at
+coordinates rather than paragraphs, so changing a word mid-sentence means
+covering the old one and drawing new, which shows. And XFA forms (LiveCycle,
+some government documents) are a different format that cannot be filled —
+`pdf_info` says so rather than reporting zero fields and leaving you guessing.
+
+### Scanned PDFs
+
+A PDF whose text cannot be read — a photographed or scanned worksheet, or one whose text layer is broken — used to be refused outright. Its pages are now rendered to images and attached the way any other image is, so a vision-capable model (`qwen2.5vl`, `llava`, `gemma3`) can read it. The attachment text says plainly that the document was a scan and how many pages were attached, so the model is never guessing at what it was given.
+
+Rendering is a fallback, never the first choice: a PDF with real text is extracted as text, which is smaller, cheaper and more accurate. The test is whether the extracted text is *legible*, not merely whether it exists — a subset font with no ToUnicode map extracts private-use glyphs and a mis-declared encoding extracts replacement characters, both of which are plentiful text and complete nonsense. Those documents render as images too, and the attachment says which fault was found. The checks are character-class based so other scripts and maths-heavy papers are never mistaken for garble; text that is merely *wrong* — a bad encoding mapping one real letter onto another — reads as prose at this level and is not caught. Pages are capped at eight, and the message names the ones left out — a long scan at readable resolution consumes a context window far faster than the same document as text. If the selected model cannot see images, the error says that the file is a scan, why that means images, and which models can read it.
 
 ### Model degradation detection
 
 Local models degrade before they fail loudly — glitch tokens, byte-fallback artifacts, self-talk leaking into written files, and runaway repetition. Brittain Code scans generated content and tool arguments for those signatures inside the streaming layer, so every caller (main agent, subagent, verifier, coder) is protected without per-call-site changes. A detected episode recovers with a context compaction — the "sanity reset" that empirically clears it — rather than silently writing corrupted code, and gives up honestly if it recurs.
+
+### What compaction keeps
+
+Compacting a conversation summarizes the older half and keeps the most recent complete turns verbatim, because those are both the most relevant part of the session and the cheapest to preserve. Tails always start at one of your messages, so a tool result is never separated from the call that produced it. Small context windows keep a proportionally larger share, since a flat percentage of 8K leaves too little to work from.
+
+The summary itself is checked before anything is thrown away. One that is too thin for the conversation it covers earns a single retry naming the length it missed, and the old messages are not replaced until a summary passes. If none does, compaction keeps a larger stretch of raw conversation and says so, rather than continuing from a record that lost the session — and if not even one complete turn fits, it declines and changes nothing.
+
+Alongside the summary, compaction carries a **session ledger** read directly off the tool record: files changed, commands run and their outcomes, project checks, unresolved errors, and anything you denied. Those facts are extracted mechanically rather than recalled, so a denied write is never reported as work done and the file list cannot quietly go missing. The summary itself is requested by section — goal, constraints, decisions, state, next steps — with a minimum length, and one retry when it arrives thin or unlabelled.
+
+Each ledger is also written to `runs/` in the app's data directory as it is produced, so the record outlives the compaction that created it. `/ledger` shows what the current session has done and lists the snapshots saved so far. Every compaction reports tokens before and after, the summary size, ledger entries, how many turns survived intact, and whether a retry was needed.
+
+### Unattended runs
+
+`/agent <goal>` runs a single agent loop with nobody watching — one model working the goal, free to spawn a subagent when it needs one. It is not the planner/coder/verifier mission pipeline; "check my emails" should not stand up three models. It is a commitment rather than a setting: where there is a repository it moves work onto a generated branch and checkpoints it, and it always writes a report, however the toggles happen to sit. `--policy <name>` picks an autonomy policy for that run alone without changing your default.
+
+**Parked calls.** Unattended, a call only a human may approve — money, destructive operations, sensitive reads, untrusted MCP tools — no longer ends the run without it. The call's exact arguments are frozen, the run suspends, and a notification says a decision is waiting. `/pending` lists suspended runs; approve or deny each call, then `/pending resume` continues the run from exactly where it stopped, executing what was parked — never a regenerated variant. Undecided calls at resume count as denied, and a decision nobody makes for six hours expires. Ordinary risky calls a policy merely does not list are still deferred (recorded, skipped, the run continues) — a defer's answer would be stale by morning anyway.
+
+**The project workspace.** `/workspace init` creates `<project>/.brittain/` and relocates the agent's memory into `MEMORY.md` there, where it shows up in diffs and travels with the repository. The directory also holds `HEARTBEAT.md` (below), a project-scoped `triggers.json` and optional `autonomy.json`, and a starter `.gitignore` covering the volatile half (`state.json`, `runs/`). These files can arrive via `git pull` from anyone, so they follow strict trust rules: memory and heartbeat text are injected as data, never instructions; a project `autonomy.json` can only *narrow* the active policy (widening lives in the app-data `autonomy.json`, outside the repository); and project triggers arrive disabled — they fire only after `/agent trigger enable <id>`, and re-disable automatically if a pull changes their definition. `remember` refuses key-shaped facts when memory is in-repo, since a committed credential is a published one. Nothing creates the folder for you: because its presence is what moves memory out of app data and into the working tree, an unattended run in a project without one mentions `/workspace init` once and writes nothing. `/workspace` on its own shows what the folder holds; `/memory move` does the same thing as `init` and remains for the memory-specific path.
+
+**Heartbeats.** `/workspace init` ships an inert heartbeat trigger in `.brittain/triggers.json` alongside an empty `HEARTBEAT.md`: write a checklist item, then `/agent trigger enable heartbeat`. Until both are done it does nothing — an empty checklist has nothing to evaluate, and a project trigger has to be enabled locally regardless. An item commented out with `<!-- -->` does not run. A trigger of `{"type": "heartbeat"}` fires no fixed goal. On its interval (frontmatter in `HEARTBEAT.md`; 15-minute floor, optional quiet hours) it reads the project's checklist and acts only on items whose condition is currently true, recording what it concluded in `state.json` for the next beat to read. That is the difference between scheduled and autonomous: cron fires a goal, a heartbeat asks a question.
+
+**The daemon.** Triggers normally fire only while the app is open. `/agent daemon install` (macOS, opt-in, never automatic) installs a LaunchAgent that runs the app `--headless`: no window, the same runtime, answering on a unix domain socket — deliberately not a network port. The daemon owns the trigger scheduler; a window that finds it alive does not start a second one. `/agent daemon start` and `stop` control it without reinstalling — start also restarts, which is how you pick up an edited config, and both report what the daemon is actually doing rather than that a command was issued. It writes `daemon.out.log` and `daemon.err.log` beside the other application data, which is the first place to look if it will not stay up.
+
+**Separate conversations per origin.** A Discord thread, each trigger, each heartbeat and the app window each keep their own conversation, history entry, ledger and context. They share a process — only one run executes at a time — but not a transcript, so a heartbeat firing overnight does not reason with the afternoon's chat still in scope, and a run started from Discord is saved under its own chat rather than mixed into whatever the window was doing. A run that does not declare an origin belongs to the window, which is what everything started from the app does.
+
+**Reach it from Discord.** A bridge between a Discord bot and the agent makes it reachable from a phone. It runs inside the app — or inside the daemon, whichever owns the trigger scheduler — so there is no separate process to keep alive and it works in a packaged build. `/discord` shows its state, `/discord edit` opens the config, and changes take effect on restart. (`npm run discord` runs it standalone against a running daemon, for a checkout.) Message it a goal and it runs unattended in the configured project; `!pending`, `!approve`, `!deny`, `!resume`, `!status` and `!stop` mirror the slash commands, and `!compact`, `!clear`, `!usage`, `!ledger` and `!memory` do the same for the conversation itself. Those act on the channel they are sent from — a long thread compacting whatever the app happens to have open would be both useless and destructive — and are refused while a run is in flight, since switching conversations under a live loop is what tears them. This is what parked calls were built for — a run suspends on your desktop, the bridge tells you what it is waiting on, and you approve from wherever you are; the frozen call then executes at home.
+
+The bot speaks as it works: each thing the model says is relayed when it says it, so a run that narrates its way through several steps reads as a conversation rather than arriving as one closing paragraph. What is not relayed is the machinery — tool calls, results, transcript paths, branch names, compaction notices — since none of it is actionable from a phone. Failures and skipped calls still break the silence.
+
+If the agent needs to ask you something — the `ask_user` tool — the question arrives wherever the run is being driven from, with any options numbered so you can reply with a digit. Your next ordinary message answers it; `!` commands still work, so `!stop` is never swallowed by a question you would rather abandon. A question nobody answers within ten minutes gives up rather than holding the run open.
+
+The bridge holds no authority of its own: it turns an allowlisted person's message into the same run the app starts, under the same policy, so every invariant and every decision record still applies. Setup needs a bot account — Discord does not permit automating a user account — and the bot must share a server with you before it can open a DM, so invite it to one (a private server with only you is fine). Enable the Message Content intent on the application, or it cannot read what you send. Configuration lives in `discord.json` in the application-data directory and ships disabled. Unprompted messages — a run parking at 3am, a heartbeat's result — go to `notifyChannelId`, or to a DM the bridge opens with the first owner at startup, so it can reach you without being spoken to first. It answers nobody until `ownerIds` names you, and with no `channelIds` it accepts direct messages only — a shared channel has to be opted into by naming it. Messages from bots, from non-owners, and from channels you did not list are dropped without a reply. It adds no dependencies: Node ships a WebSocket client, and the gateway protocol is hand-rolled for the same reason the MCP client is.
+
+**Graduated MCP trust.** "MCP is never automatic" is right for a server installed five minutes ago and wrong forever after. A `trust` map in `mcp.json` (`{"search": "allow", "send": "park"}`) grants specific tools on a specific server; the grant is keyed to the server's command line and voids itself if that changes (`/mcp trust accept <server>` re-affirms). The financial, destructive, and sensitive invariants still apply to trusted MCP calls.
+
+**The learning loop.** Every run's verdicts accumulate. A call held (deferred or parked) five or more times across runs and never denied by a human surfaces in `/policies` as a promotion suggestion; `/policies promote <custom-policy> <tool>` adds it to that policy's allow list. Never automatic — the aggregate produces evidence, a person clicks. Built-in policies cannot be widened.
+
+**Reaching outside the project.** File tools are confined to the working directory, which is right for a coding agent and wrong for an assistant that should be able to read your notes. A custom policy may list `roots`:
+
+```json
+{ "policies": { "assistant": { "allowRisky": true, "roots": ["~/Documents/notes", "~/Downloads"] } } }
+```
+
+Those directories become readable and writable alongside the project. Paths must be absolute or start with `~`; the filesystem root is refused, and anything unusable is reported rather than silently dropped. Relative paths still mean the project, so a granted root is only ever reached by naming it. Every run that has roots says so in its output, and `/policies` lists them — this is the widest setting in the file, so it is deliberately hard to forget about. It lives in the app-data `autonomy.json` only: a project's `.brittain/autonomy.json` can only narrow, so a file arriving in a pull request cannot hand the agent the rest of the disk.
+
+**Sandboxing.** A custom policy with `"sandbox": true` runs unattended shell commands under macOS `sandbox-exec`, with writes confined to the project and temp directories — path confinement as an OS guarantee rather than a code one. On platforms without a sandbox the run says so plainly and continues unconfined.
+
+Starting an unattended run shows a one-time-per-project disclosure: undo is the wrong safety model for a run that can act on the world, so it states plainly that the agent acts on its own — running commands, driving a browser, calling connected tools — and that some actions cannot be undone. A Git repository is no longer required; when there is one the run still branches and checkpoints for its file-level work, and when there is not, the disclosure is the guard and file-level undo simply does not apply. A policy can still opt into requiring a generated branch, which only applies inside a repository.
+
+Because nobody is there to answer, a call that would normally prompt is *deferred*: it does not run, it is recorded, and the run carries on rather than stalling until morning. When the run ends you get a foldable decision log in the chat listing every verdict, with the deferred calls separated out as the ones that need you.
+
+Autonomy runs inside a fence, not on a blanket waiver. An **autonomous** policy (see `/policies edit`) can run risky tools unattended while a tool-call ceiling, a required branch, and the standing invariants still hold. Four things stay held for a person whatever the policy says: destructive operations, sensitive reads, external MCP tools, and anything that moves money. The money guard is a heuristic backstop — a payment-provider API call, a checkout, a crypto send — surfaced as a spending approval so that spending meets you at the moment it happens rather than at launch.
+
+Each run leaves a timestamped transcript and a markdown report in `runs/` in the application-data directory, and raises a notification when it finishes.
+
+`/agent trigger` manages scheduled unattended runs, defined in `triggers.json` in the application-data directory using ordinary cron fields (`*`, `N`, `a-b`, `*/n`, and comma lists). `/agent trigger new` creates and reveals the file, `/agent trigger list` shows what is configured along with anything waiting to run, and `/agent trigger run <id>` fires one immediately, ignoring its schedule — the honest way to test the whole path with someone watching. A generated example is always created disabled, so nothing runs until you have edited it.
+
+Triggers only fire while Brittain Code is open. A trigger that fires while a mission is already running is queued rather than dropped: the same trigger replaces its own pending entry instead of stacking copies, entries expire rather than running hours late, and a queued run is branched and checkpointed when it starts rather than against the tree it was queued against.
 
 ### Undoing a run
 
@@ -55,7 +177,7 @@ Coordinated edits can use an atomic multi-file batch: every exact match and synt
 
 The status bar shows: current state, context usage (tokens used vs the model's context window, with a fill bar), elapsed time for the current run, and total tool calls.
 
-**NEW SESSION** clears the conversation (context resets to zero).
+**New chat** clears the conversation (context resets to zero).
 
 ## Settings
 
@@ -63,11 +185,13 @@ The status bar shows: current state, context usage (tokens used vs the model's c
 
 The inference endpoint accepts an `http://` or `https://` base URL containing only a host and optional port, such as `http://127.0.0.1:9001`. **TEST** checks the endpoint's `/api/tags` response before saving. This supports servers that implement Ollama's `/api/tags`, `/api/show`, and `/api/chat` shapes; other provider protocols will need a provider adapter. A non-loopback endpoint sends prompts, attachment contents, and tool context to that server, so it is no longer local-only.
 
-Chats are saved automatically as individual JSON files in the application-data directory — `~/Library/Application Support/Brittain Code/` on macOS, `%APPDATA%\Brittain Code\` on Windows — under `chats/` (with an `index.json` for the sidebar). They survive app updates and rebuilds, and are never included in the built app. The sidebar puts folder-free conversations under **GENERAL** and groups Code chats by project folder. Loading a chat restores its mode, model, directory, THINK, and AUTO-APPROVE states, but never restores RESEARCH.
+Chats are saved automatically as individual JSON files in the application-data directory — `~/Library/Application Support/Brittain Code/` on macOS, `%APPDATA%\Brittain Code\` on Windows — under `chats/` (with an `index.json` for the sidebar). They survive app updates and rebuilds, and are never included in the built app. The sidebar puts folder-free conversations under **GENERAL** and groups Code chats by project folder. Loading a chat restores its mode, model, directory, THINK, AUTO-APPROVE, and ONLINE RESEARCH states.
+
+The user message is saved before inference starts. You can open another saved chat or start a new chat while the model continues in the background. The sidebar marks each request as **RUNNING** or **QUEUED**. Requests run one at a time, which prevents two Code chats from editing the same project at once. Stream events carry their chat ID, so background output cannot appear in the chat that is currently open. Complete assistant messages and tool results are saved during long runs instead of only at the end.
 
 ## Online research
 
-**ONLINE RESEARCH** is an explicit session-only switch. Enabling it warns that search queries and requested URLs leave your machine. It exposes two additional model tools:
+**ONLINE RESEARCH** is an explicit switch. Turning it on warns that search queries and requested URLs leave your machine. A new or older chat always starts with it off. A chat saved with ONLINE on restores the switch when you return to it. It exposes two additional model tools:
 
 - `web_search` sends a redacted, length-limited query to DuckDuckGo's no-JavaScript HTML search. Optional domain filters and result caps are supported.
 - `web_fetch` retrieves a public HTTPS page as sanitized plain text. It rejects local/private/reserved destinations and URL credentials, validates every redirect, refuses non-text content, strips scripts and styles, and caps both downloads and returned text.
@@ -103,7 +227,15 @@ Type these in the message box:
 | `/recs` | Compare installed models by memory fit, capabilities, measured speed, and local Brittainmark results |
 | `/auto <request>` | Select the best compatible installed model for the current mode and attachments, then run the request |
 | `/mcp [on\|off <server>]` | External MCP tool servers: status, enable, disable |
-| `/memory` | View what the agent has remembered for the selected project |
+| `/discord [edit]` | Bridge a Discord bot to the agent so it is reachable from a phone |
+| `/workspace [init]` | The project's `.brittain` folder: in-repo memory, heartbeat checklist, project triggers |
+| `/memory [move]` | View what the agent has remembered; `move` relocates it into the project's `.brittain/MEMORY.md` |
+| `/agent [--policy <name>] <goal>` | Run unattended: always branched, checkpointed, and reported |
+| `/agent trigger [list\|new\|run <id>\|enable <id>\|disable <id>]` | Scheduled unattended runs; enable/disable act on project (`.brittain`) triggers |
+| `/agent daemon [status\|start\|stop\|install\|uninstall]` | The headless runtime that keeps triggers and heartbeats firing with every window closed |
+| `/pending [approve\|deny [<run>] [n\|all]\|resume [<run>]]` | Parked calls from suspended unattended runs; the run id is optional while only one is waiting |
+| `/policies [edit\|promote <policy> <tool>]` | Autonomy policies, held calls, and evidence-backed promotion suggestions |
+| `/ledger` | View what this session changed, ran, and failed at (survives compaction) |
 | `/export` | Save the chat as a markdown file |
 | `/tools` | List available tools and their risky, sensitive, or network classification |
 
@@ -113,7 +245,7 @@ Type these in the message box:
 
 `/loop` is the original single-model, conversation-preserving loop. For planned, verifier-guided implementation and repair work, use `/mission`: it records its goal, project, models, phase, latest evidence, final report, and recovery anchors under Brittain Code’s application-data directory. It keeps the same tool permissions and approval rules as ordinary Code mode. Only one mission can run at a time. Closing the app marks an active mission as interrupted. `/mission resume` continues only after the project path, Git commit, working-tree fingerprint, and saved checkpoint all match the last persisted mission event. Missions do not run after the app exits and have no messaging, scheduling, or external-notification integration.
 
-The planner can use `web_search` and `web_fetch` only when ONLINE RESEARCH is enabled, with the same per-request approval boundary as ordinary chats. Coding workers and verifiers never receive network tools. Run `/recs` after installing a new Ollama model to refresh the model list. The recommendations popup compares installed models at the current context cap. Memory values are marked as measured or estimated, and speed is learned from responses during the current app run.
+The planner can use `web_search` and `web_fetch` only when ONLINE RESEARCH is enabled, with the same per-request approval boundary as ordinary chats. Settings has an **Auto-approve online requests** toggle for anyone tired of confirming each search: it removes the per-request prompt but not the ONLINE switch itself, it cannot overrule an autonomy policy that names online requests, and it never covers a call that is also sensitive, destructive, or an MCP tool — those keep asking. Coding workers and verifiers never receive network tools. Run `/recs` after installing a new Ollama model to refresh the model list. The recommendations popup compares installed models at the current context cap. Memory values are marked as measured or estimated, and speed is learned from responses during the current app run.
 
 ## MCP servers
 

@@ -1,0 +1,366 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const { createSecretStore } = require('../../src/main/secrets');
+const { DEFAULT_SETTINGS, normalizeSettings } = require('../../settings');
+const read = (name) => fs.readFileSync(path.join(__dirname, '..', '..', name), 'utf8');
+
+const store = (safeStorage = null) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-secret-'));
+  return { dir, secrets: createSecretStore({ userDataDir: () => dir, safeStorage }) };
+};
+
+test('the provider is chosen, never guessed from a URL', () => {
+  // This decides whether a conversation leaves the machine.
+  assert.equal(DEFAULT_SETTINGS.provider, 'ollama', 'local by default');
+  assert.equal(normalizeSettings({ provider: 'openai' }).provider, 'openai');
+  assert.equal(normalizeSettings({ provider: 'anthropic' }).provider, 'ollama', 'an unknown value stays local');
+  assert.equal(normalizeSettings({}).provider, 'ollama');
+});
+
+test('a key is stored outside settings.json', () => {
+  // settings.json is plain text a user is invited to edit and paste into bug
+  // reports. A credential that pays for things does not belong there.
+  const { dir, secrets } = store();
+  secrets.set('providerApiKey', 'sk-secret-value');
+  assert.equal(secrets.get('providerApiKey'), 'sk-secret-value');
+  assert.ok(fs.existsSync(path.join(dir, 'credentials.json')));
+  assert.ok(!fs.existsSync(path.join(dir, 'settings.json')));
+});
+
+test('a key file is not world-readable', () => {
+  const { dir, secrets } = store();
+  secrets.set('providerApiKey', 'sk-x');
+  const mode = fs.statSync(path.join(dir, 'credentials.json')).mode & 0o777;
+  assert.equal(mode, 0o600);
+});
+
+test('it encrypts where the OS allows and says so where it does not', () => {
+  const fakeKeychain = {
+    isEncryptionAvailable: () => true,
+    encryptString: (text) => Buffer.from(`enc:${text}`),
+    decryptString: (buffer) => String(buffer).replace(/^enc:/, ''),
+  };
+  const { dir, secrets } = store(fakeKeychain);
+  assert.equal(secrets.set('providerApiKey', 'sk-x').encrypted, true);
+  assert.equal(secrets.get('providerApiKey'), 'sk-x');
+  // On disk it must not be readable as-is.
+  assert.ok(!fs.readFileSync(path.join(dir, 'credentials.json'), 'utf8').includes('sk-x'));
+
+  // Without a keychain it still works, and reports honestly that it is plain.
+  const plain = store();
+  assert.equal(plain.secrets.set('providerApiKey', 'sk-y').encrypted, false);
+  assert.equal(plain.secrets.get('providerApiKey'), 'sk-y');
+});
+
+test('the key never crosses to the renderer', () => {
+  const { secrets } = store();
+  secrets.set('providerApiKey', 'sk-abcdefghijklmnop');
+  const described = secrets.describe('providerApiKey');
+  assert.equal(described.set, true);
+  assert.ok(!described.hint.includes('efghijklm'), 'only the ends are shown');
+  assert.match(described.hint, /^sk-a…mnop$/);
+  // And the IPC handler returns describe(), not the value.
+  const main = read('main.js');
+  assert.match(main, /key: secrets\.describe\('providerApiKey'\)/);
+  assert.ok(!/providerApiKey'\)\s*,\s*value/.test(main));
+});
+
+test('clearing a key removes it rather than storing an empty one', () => {
+  const { secrets } = store();
+  secrets.set('providerApiKey', 'sk-x');
+  secrets.set('providerApiKey', '');
+  assert.equal(secrets.get('providerApiKey'), '');
+  assert.equal(secrets.describe('providerApiKey').set, false);
+});
+
+test('only a cloud transport is given the key', () => {
+  const main = read('main.js');
+  assert.match(main, /apiKey: transport\.needsKey \? secrets\.get\('providerApiKey'\) : ''/,
+    'a local endpoint has no business receiving a credential');
+});
+
+test('the posture change is stated plainly, not buried', () => {
+  const app = read('renderer/app.js');
+  assert.match(app, /EVERY message in this mode leaves your machine/);
+  assert.match(app, /Nothing leaves your machine: inference runs locally\./);
+  // And it names the consequence that is easy to miss.
+  assert.match(app, /reach well beyond the project folder/);
+});
+
+test('a missing key is called out before it becomes a confusing rejection', () => {
+  assert.match(read('renderer/app.js'), /NOT SET — runs will be rejected/);
+});
+
+test('provider and key are configured in one place', () => {
+  // Splitting one coherent setting between a modal and a slash command means
+  // neither is the answer to "where do I change this".
+  const html = read('renderer/index.html');
+  for (const id of ['setting-provider', 'setting-api-key']) {
+    assert.ok(html.includes(`id="${id}"`), `${id} belongs in Settings`);
+  }
+  assert.match(read('renderer/app.js'), /provider: \$\('setting-provider'\)\.value === 'openai' \? 'openai' : 'ollama'/);
+});
+
+test('rates are read from the provider, not typed in', () => {
+  // They were a field nobody could keep accurate: prices change, and the model
+  // catalog already carries the provider's own published figures.
+  const html = read('renderer/index.html');
+  assert.ok(!html.includes('setting-input-rate'), 'the manual rate fields are gone');
+  assert.ok(!html.includes('setting-output-rate'));
+  const settings = read('settings.js');
+  assert.ok(!settings.includes('inputPerMillion'), 'and gone from the settings model too');
+  assert.match(read('main.js'), /function ratesForModel\(model\)/);
+});
+
+test('each provider choice supplies a useful default endpoint', () => {
+  const html = read('renderer/index.html');
+  const app = read('renderer/app.js');
+  assert.match(html, /value="ollama" data-default-endpoint="http:\/\/127\.0\.0\.1:11434"/);
+  assert.match(html, /value="openai" data-default-endpoint="https:\/\/openrouter\.ai\/api\/v1"/);
+  assert.match(app, /syncProviderFields\(\{ useDefaultEndpoint: true \}\)/);
+  assert.match(app, /if \(useDefaultEndpoint && defaultEndpoint\) \$\('setting-endpoint'\)\.value = defaultEndpoint/);
+});
+
+test('the key is saved through its own channel, not with the settings blob', () => {
+  // A credential should not ride along in an object that gets logged, diffed
+  // and written to a plain-text file.
+  const app = read('renderer/app.js');
+  assert.match(app, /window\.api\.providerSetKey\(field\.value\)/);
+  const save = app.slice(app.indexOf("inferenceEndpoint: $('setting-endpoint')"), app.indexOf("inferenceEndpoint: $('setting-endpoint')") + 500);
+  assert.ok(!save.includes('setting-api-key'), 'the key must not be part of settingsSave');
+  // And the field is cleared after saving, so it is not left on screen.
+  assert.match(app, /field\.value = '';/);
+});
+
+test('the Jev key uses the secret store and its own IPC channel', () => {
+  const { secrets } = store();
+  secrets.set('jevApiKey', 'jev-secret-value');
+  assert.equal(secrets.get('jevApiKey'), 'jev-secret-value');
+
+  const main = read('main.js');
+  const preload = read('preload.js');
+  const app = read('renderer/app.js');
+  assert.match(main, /key: secrets\.describe\('jevApiKey'\)/);
+  assert.match(main, /secrets\.set\('jevApiKey', value\)/);
+  assert.match(preload, /jevSetKey: \(value\) => ipcRenderer\.invoke\('jev:setKey', value\)/);
+  assert.match(app, /window\.api\.jevSetKey\(field\.value\)/);
+  const save = app.slice(app.indexOf("compactionEngine: $('setting-compaction-engine')"), app.indexOf("compactionEngine: $('setting-compaction-engine')") + 500);
+  assert.ok(!save.includes('setting-jev-key'), 'the Jev key must not be part of settingsSave');
+});
+
+test('cloud-only fields are hidden rather than shown dead', () => {
+  const app = read('renderer/app.js');
+  assert.match(app, /\$\('settings-cloud-fields'\)\.classList\.toggle\('hidden', !cloud\)/);
+  assert.match(app, /addEventListener\('change', \(\) => syncProviderFields\(\{ useDefaultEndpoint: true \}\)\)/);
+});
+
+test('/provider reports state and points at Settings to change it', () => {
+  const app = read('renderer/app.js');
+  assert.match(app, /Change any of this in Settings\./);
+  assert.ok(!app.includes('/provider key <value> stores the key'), 'configuration lives in one place');
+});
+
+test('the provider fields look like settings rows, not section headings', () => {
+  // Standalone labels rendered as full-width text in the pane's grid, so they
+  // competed with the section header instead of reading as fields.
+  const html = read('renderer/index.html');
+  const section = html.slice(html.indexOf('INFERENCE ENDPOINT'), html.indexOf('</section>', html.indexOf('INFERENCE ENDPOINT')));
+  for (const field of ['Provider', 'API key']) {
+    assert.ok(section.includes(`<label>${field} `), `${field} should be a label wrapping its control`);
+  }
+  assert.ok(!/<label for="setting-/.test(section), 'no detached labels in this pane');
+});
+
+test('the consequence of going cloud is beside the choice, not inside the dropdown', () => {
+  // An option label cannot be read once the menu closes.
+  const html = read('renderer/index.html');
+  assert.match(html, /<option value="openai"[^>]*>Cloud \(OpenAI-compatible\)<\/option>/);
+  assert.ok(!html.includes('every message is sent to the endpoint</option>'));
+  const app = read('renderer/app.js');
+  assert.match(app, /Every message is sent to this endpoint, including the contents of files the agent reads\./);
+  assert.match(app, /Inference runs on this machine\. Nothing is sent anywhere\./);
+});
+
+test('the copy explains the setting, not the implementation', () => {
+  const html = read('renderer/index.html');
+  assert.ok(!html.includes('Chosen rather than detected from the URL'), 'that reasoning belongs in a commit message');
+  assert.ok(!html.includes('Never shown in full again'));
+});
+
+test('the key status lines up under the field, not in open space', () => {
+  // It was positioned with a guessed offset — min(120px, 37.5%) — while the
+  // real first column is 0.75fr, so it landed in the middle of nowhere.
+  const css = read('renderer/style.css');
+  const status = css.slice(css.indexOf('#settings-key-status {'), css.indexOf('#settings-key-status:empty'));
+  const label = css.slice(css.indexOf('.settings-section label {'), css.indexOf('.settings-section label.check-row'));
+  const columns = /grid-template-columns:([^;]+);/;
+  assert.equal(status.match(columns)[1].trim(), label.match(columns)[1].trim(),
+    'the status must use the same columns as the labels it sits among');
+  assert.match(status, /::before|grid-column/, 'and leave the label cell empty');
+  assert.ok(!css.includes('min(120px, 37.5%)'), 'no guessed offsets');
+});
+
+test('an empty status takes no vertical space', () => {
+  assert.match(read('renderer/style.css'), /#settings-key-status:empty \{ display: none; \}/);
+});
+
+test('TEST probes the path the selected protocol actually uses', () => {
+  // Testing Ollama's /api/tags against a cloud provider returns a 404 that
+  // explains nothing.
+  const main = read('main.js');
+  const handler = main.slice(main.indexOf("ipcMain.handle('settings:testEndpoint'"), main.indexOf("ipcMain.handle('settings:testEndpoint'") + 1400);
+  assert.match(handler, /if \(String\(provider\) === 'openai'\)/);
+  assert.match(handler, /endpoint \+ providerPath\('openai', 'models'\)/);
+  assert.match(handler, /endpoint \+ localModelsPath/);
+  // An auth failure is named as one rather than reported as a status code.
+  assert.match(handler, /The endpoint rejected the saved API key\./);
+  assert.match(handler, /needs an API key — save one below first\./);
+  // And the renderer says which provider it is testing.
+  assert.match(read('renderer/app.js'), /settingsTestEndpoint\(\$\('setting-endpoint'\)\.value, \$\('setting-provider'\)\.value\)/);
+});
+
+test('models are listed from wherever the configured provider keeps them', () => {
+  // Asking Ollama's /api/tags of a cloud endpoint returns nothing, which the
+  // app read as "no server" and answered with an install-Ollama screen.
+  const main = read('main.js');
+  const handler = main.slice(main.indexOf("ipcMain.handle('models:list'"), main.indexOf("const getModelRecommendations"));
+  assert.match(handler, /if \(runtimeSettings\.provider === 'openai'\)/);
+  assert.match(handler, /inferenceEndpoint\(\) \+ providerPath\('openai', 'models'\)/);
+  assert.match(handler, /normalizeOpenAIModels\(listed\)/, 'OpenAI model entries keep their IDs and useful metadata');
+  assert.match(handler, /ollamaJson\(providerPath\('ollama', 'models'\)\)/, 'and the local path stays provider-owned');
+});
+
+test('changing only the provider still refreshes models and runtime caches', () => {
+  const main = read('main.js');
+  const renderer = read('renderer/app.js');
+  assert.match(main, /endpointChanged \|\| providerChanged/);
+  assert.match(renderer, /oldEndpoint !== appSettings\.inferenceEndpoint \|\| oldProvider !== appSettings\.provider/);
+});
+
+test('the failure names the provider so the screen can speak its language', () => {
+  const main = read('main.js');
+  const handler = main.slice(main.indexOf("ipcMain.handle('models:list'"), main.indexOf("const getModelRecommendations"));
+  assert.match(handler, /provider: 'openai', error:/);
+  assert.match(handler, /provider: 'ollama', error:/);
+  assert.match(handler, /rejected the saved API key\./);
+});
+
+test('a cloud user is never told to install Ollama', () => {
+  // They configured a cloud provider on purpose; that is advice for a problem
+  // they do not have, and it hides the one they do.
+  const app = read('renderer/app.js');
+  assert.match(app, /const cloud = provider === 'openai';/);
+  assert.match(app, /ollamaBtn\.classList\.toggle\('hidden', cloud \|\| state !== 'unreachable'\)/);
+  assert.match(app, /CANNOT REACH THE PROVIDER/);
+  assert.match(app, /Check the endpoint URL and API key in Settings/);
+  // And the cloud branch returns before the ollama serve copy is reached.
+  const gate = app.slice(app.indexOf('function renderOnboarding'), app.indexOf('function addCopyableCommand'));
+  assert.ok(gate.indexOf('if (cloud) {') < gate.indexOf("addCopyableCommand(body, 'ollama serve')"));
+});
+
+test('cloud recommendations do not probe local model-management routes', () => {
+  const main = read('main.js');
+  const wrapper = main.slice(main.indexOf('async function getModelRecommendations'), main.indexOf("ipcMain.handle('models:recommendations'"));
+  assert.match(wrapper, /runtimeSettings\.provider === 'openai'/);
+  assert.match(wrapper, /Hardware-fit recommendations apply only to local models/);
+  assert.ok(wrapper.indexOf("provider === 'openai'") < wrapper.indexOf('getLocalModelRecommendations'));
+});
+
+test('a cloud model is budgeted by the window the provider states', () => {
+  // /api/show is an Ollama path; probing it on a cloud endpoint threw, the
+  // catch answered 8192, and a million-token model was compacted almost
+  // immediately while Settings showed 128K.
+  const main = read('main.js');
+  const body = main.slice(main.indexOf('async function getContextLength'), main.indexOf('async function getContextLength') + 1200);
+  assert.match(body, /if \(runtimeSettings\.provider === 'openai'\)/);
+  assert.match(body, /catalogDetails\.get\(model\)\?\.contextLength/);
+  // Unknown must not mean tiny: on this transport num_ctx is never sent, so the
+  // figure only drives local budgeting.
+  assert.match(body, /runtimeSettings\.mainContextCap \|\| NUM_CTX_CAP/);
+  assert.ok(body.indexOf("provider === 'openai'") < body.indexOf("ollamaJson(providerPath('ollama', 'model')"),
+    'the cloud branch must return before the Ollama probe');
+});
+
+test('the listing feeds the catalog, and a stale guess is dropped', () => {
+  const main = read('main.js');
+  assert.match(main, /rememberModelDetails\(modelDetails\);/);
+  // The 8192 fallback may already be cached from before the catalog arrived.
+  const remember = main.slice(main.indexOf('function rememberModelDetails'), main.indexOf('async function getContextLength'));
+  assert.match(remember, /contextCache\.clear\(\);/);
+});
+
+test('the catalog reads a real provider listing', () => {
+  const { normalizeOpenAIModels } = require('../../src/main/model-catalog');
+  const [model] = normalizeOpenAIModels({
+    data: [{
+      id: 'z-ai/glm-5.3-flash',
+      context_length: 1048576,
+      pricing: { prompt: '0.000000075', completion: '0.00000025' },
+      architecture: { input_modalities: ['text', 'image'] },
+    }],
+  });
+  assert.equal(model.contextLength, 1048576);
+  assert.deepEqual(model.modalities, ['text', 'image']);
+  // Per-token rates become per-million, which is how the cost fields are set.
+  assert.equal(model.inputPricePerMillion, 0.075);
+  assert.equal(model.outputPricePerMillion, 0.25);
+});
+
+test('a cloud model that reads images is allowed to', () => {
+  // The provider states its modalities in the listing. Probing /api/show for
+  // them fails on a cloud endpoint, so a model that plainly reads images was
+  // told it could not.
+  const main = read('main.js');
+  const caps = main.slice(main.indexOf('async function getCapabilities'), main.indexOf('const supportsThinking'));
+  assert.match(caps, /if \(runtimeSettings\.provider === 'openai'\)/);
+  assert.match(caps, /modalities\.includes\('image'\) \? \['vision'\] : \[\]/);
+  assert.ok(caps.indexOf("provider === 'openai'") < caps.indexOf("ollamaJson(providerPath('ollama', 'model')"),
+    'the cloud branch must return before the Ollama probe');
+});
+
+test('an unstated capability is attempted, not refused', () => {
+  // A wrong refusal is a hard block with no way around it; a wrong attempt
+  // comes back as a provider error naming the reason. Capability is not a
+  // safety boundary.
+  const main = read('main.js');
+  const caps = main.slice(main.indexOf('async function getCapabilities'), main.indexOf('const supportsThinking'));
+  assert.match(caps, /return \['vision'\];/);
+  assert.match(caps, /capability question, not a safety one/);
+});
+
+test('a new catalog invalidates both cached guesses', () => {
+  const main = read('main.js');
+  const remember = main.slice(main.indexOf('function rememberModelDetails'), main.indexOf('async function getContextLength'));
+  assert.match(remember, /contextCache\.clear\(\);/);
+  assert.match(remember, /capsCache\.clear\(\);/);
+});
+
+test('no thinking gate is left on the capability probe alone', () => {
+  // getCapabilities() reports only vision on the OpenAI transport, so
+  // supportsThinking() is false for every API model. A site that gates on it
+  // sends nothing about thinking and leaves the server on its own default —
+  // which, on a build with no reasoning parser, returns the trace inside
+  // `content` where it cannot be stripped back out.
+  const main = read('main.js');
+  // thinkValue() is where the probe legitimately still appears — it is the
+  // Ollama half of the decision. Everywhere else must defer to it.
+  const callers = main.slice(0, main.indexOf('async function thinkValue'))
+    + main.slice(main.indexOf('const summarizerThink'));
+  const sites = callers.match(/\(await supportsThinking\([^)]*\)\)\s*\?/g) || [];
+  assert.deepEqual(sites, [], 'every think decision must go through thinkValue()');
+  assert.match(read('src/main/chat-title.js'), /await thinkValue\(model, false\)/);
+});
+
+test('chat_template_kwargs only goes to servers that read it', () => {
+  // OpenAI itself 400s on an unrecognized body param, so the kwarg cannot be
+  // sent to every OpenAI-compatible endpoint. max_model_len is vLLM's own
+  // spelling of the context window and stands in for "this is vLLM".
+  const main = read('main.js');
+  const gate = main.slice(main.indexOf('async function thinkValue'), main.indexOf('const summarizerThink'));
+  assert.match(gate, /acceptsTemplateKwargs \? !!want : undefined/);
+  assert.match(gate, /await supportsThinking\(model\)\) \? !!want : undefined/);
+});

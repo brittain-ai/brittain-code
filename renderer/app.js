@@ -6,7 +6,57 @@ const input = $('input');
 const sendBtn = $('send-btn');
 const stopBtn = $('stop-btn');
 const modelSelect = $('model-select');
-const autoApprove = $('auto-approve');
+const autonomySelect = $('autonomy-select');
+
+const topbar = $('topbar');
+
+// Autonomy replaced the AUTO-APPROVE checkbox: one control for one concept,
+// because two overlapping supervision controls is how an unsupervised write
+// happens that nobody intended.
+let autonomyPolicy = 'supervised';
+let autonomyPolicies = [];
+const autonomyDescription = (id) => autonomyPolicies.find((entry) => entry.id === id)?.description || '';
+// Anything other than the two attended stops runs risky tools without asking.
+const runsUnattended = () => autonomyPolicy !== 'supervised' && autonomyPolicy !== 'guarded';
+
+async function loadAutonomy() {
+  const state = await window.api.autonomyState();
+  if (!state?.ok) return;
+  autonomyPolicies = state.policies;
+  autonomyPolicy = state.current;
+  autonomySelect.innerHTML = '';
+  for (const policy of state.policies) {
+    const option = document.createElement('option');
+    option.value = policy.id;
+    option.textContent = policy.label;
+    option.title = policy.description;
+    autonomySelect.appendChild(option);
+  }
+  autonomySelect.value = autonomyPolicy;
+  document.body.dataset.autonomy = runsUnattended() ? 'unattended' : 'attended';
+  $('autonomy-control').title = autonomyDescription(autonomyPolicy) || 'How much this run may do without asking';
+  syncChatLayout();
+}
+
+autonomySelect.addEventListener('change', async () => {
+  const wanted = autonomySelect.value;
+  const previous = autonomyPolicy;
+  // Selecting an unattended policy for the first time in a project should be a
+  // deliberate act, not a stray click on a dropdown.
+  if (wanted !== previous && wanted !== 'supervised' && wanted !== 'guarded') {
+    setCompactOptionsOpen(false);
+    const confirmed = await confirmDialog(
+      `Switch autonomy to "${autonomyPolicies.find((entry) => entry.id === wanted)?.label || wanted}"?\n\n`
+      + `${autonomyDescription(wanted)}\n\n`
+      + 'Risky tool calls will run without asking. Destructive operations, sensitive reads, and external MCP tools still require approval.',
+      { okLabel: 'SWITCH', danger: true }
+    );
+    if (!confirmed) { autonomySelect.value = previous; return; }
+  }
+  const res = await window.api.autonomySet(wanted);
+  if (!res.ok) { autonomySelect.value = previous; return addError(res.error); }
+  await loadAutonomy();
+});
 const chatList = $('chat-list');
 const sidebar = $('sidebar');
 const thinkToggle = $('think-toggle');
@@ -25,6 +75,9 @@ let coderModel = localStorage.getItem('coderModel') || 'qwen3-coder:30b'; // set
 let elapsedTimer = null;
 let toolCount = 0;
 let currentChatId = null;
+const chatRuns = new Map(); // chatId -> { runId, state, startedAt, unread }
+const unreadChats = new Set();
+let chatSubmitPending = false;
 let appSettings = null;
 let settingsDefaults = null;
 let currentModels = [];
@@ -33,6 +86,65 @@ let latestMission = null;
 let pendingPlanDraft = null;
 let pendingPlanCard = null;
 let updateState = null;
+let currentModelDetails = [];
+let historyEntries = [];
+let historyRequest = 0;
+
+function syncChatLayout() {
+  const hidden = sidebar.classList.contains('hidden');
+  $('history-open-btn').classList.toggle('hidden', !hidden);
+  $('history-btn').setAttribute('aria-expanded', String(!hidden));
+  $('history-open-btn').setAttribute('aria-expanded', String(!hidden));
+  $('approval-status').textContent = autonomyPolicies.find((policy) => policy.id === autonomyPolicy)?.label || 'Supervised';
+  $('approval-status').title = autonomyDescription(autonomyPolicy);
+  $('research-status').textContent = onlineResearchToggle.checked ? 'Web research on' : 'Web research off';
+  $('research-status').classList.toggle('enabled', onlineResearchToggle.checked);
+  input.placeholder = modelSelect.value ? `Message ${modelSelect.value}…` : 'Message the selected model…';
+}
+
+const newIdentity = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+const currentChatRun = () => currentChatId ? chatRuns.get(currentChatId) : null;
+const hasChatRuns = () => chatRuns.size > 0;
+const routeIsVisible = (route) => !route?.chatId || route.chatId === currentChatId;
+
+function syncChatRunControls() {
+  if (busy) return;
+  clearInterval(elapsedTimer);
+  elapsedTimer = null;
+  const run = currentChatRun();
+  sendBtn.classList.toggle('hidden', !!run);
+  stopBtn.classList.toggle('hidden', !run);
+  if (!run) {
+    $('elapsed').textContent = '0.0s';
+    setState('idle');
+    return;
+  }
+  setState(run.state === 'queued' ? 'queued' : 'working');
+  const updateElapsed = () => {
+    $('elapsed').textContent = ((Date.now() - run.startedAt) / 1000).toFixed(1) + 's';
+  };
+  updateElapsed();
+  elapsedTimer = setInterval(updateElapsed, 100);
+}
+
+function setChatRun(chatId, runId, state) {
+  chatRuns.set(chatId, { runId, state, startedAt: Date.now(), unread: false });
+  syncChatRunControls();
+  loadChatHistory();
+}
+
+function markChatRunState(route, state) {
+  if (!route?.chatId) return;
+  const run = chatRuns.get(route.chatId);
+  if (!run || (route.runId && run.runId !== route.runId)) return;
+  run.state = state;
+  if (route.chatId !== currentChatId) run.unread = true;
+  if (route.chatId === currentChatId) syncChatRunControls();
+}
+
+const activeModelPicker = window.ModelPicker?.create(modelSelect, {
+  emptyLabel: 'No models available',
+});
 
 setAppMode(appMode, false, false);
 
@@ -45,6 +157,8 @@ setAppMode(appMode, false, false);
     if (appSettings.defaultMode !== 'last') appMode = appSettings.defaultMode;
     setAppMode(appMode, false, false);
   }
+
+  await loadAutonomy();
 
   const models = await reloadModels(defaultModelForMode(appMode));
 
@@ -140,7 +254,7 @@ function renderUpdateState(state) {
 }
 
 async function installReadyUpdate() {
-  if (busy) return addError('Stop the active run before you restart to update.');
+  if (busy || hasChatRuns()) return addError('Stop active and queued runs before you restart to update.');
   const version = updateState?.version ? ` ${updateState.version}` : '';
   if (!(await confirmDialog(`Restart Brittain Code and install version${version}?`, { okLabel: 'RESTART' }))) return;
   const result = await window.api.installUpdate();
@@ -167,12 +281,17 @@ async function reloadModels(preferred = '') {
   const res = await window.api.listModels();
   modelSelect.innerHTML = '';
   if (!res.ok) {
+    $('connection-status').textContent = 'Unavailable';
     currentModels = [];
-    renderOnboarding('unreachable', res.error);
+    currentModelDetails = [];
+    activeModelPicker?.refresh([]);
+    renderOnboarding('unreachable', res.error, res.provider);
     populateSettingsModelSelects();
     return currentModels;
   }
   currentModels = res.models;
+  $('connection-status').textContent = currentModels.length ? 'Connected' : 'No models';
+  currentModelDetails = Array.isArray(res.modelDetails) ? res.modelDetails : [];
   for (const name of currentModels) {
     const opt = document.createElement('option');
     opt.value = name;
@@ -180,13 +299,15 @@ async function reloadModels(preferred = '') {
     modelSelect.appendChild(opt);
   }
   if (preferred && currentModels.includes(preferred)) modelSelect.value = preferred;
+  activeModelPicker?.refresh(currentModelDetails);
   populateSettingsModelSelects();
-  renderOnboarding(currentModels.length ? 'ok' : 'empty');
+  renderOnboarding(currentModels.length ? 'ok' : 'empty', '', res.provider);
+  syncChatLayout();
   return currentModels;
 }
 
 // ---------- onboarding overlay: unreachable endpoint / zero models installed ----------
-function renderOnboarding(state, detail) {
+function renderOnboarding(state, detail, provider = 'ollama') {
   const overlay = $('onboarding-overlay');
   const title = $('onboarding-title');
   const body = $('onboarding-body');
@@ -199,8 +320,25 @@ function renderOnboarding(state, detail) {
   }
 
   overlay.classList.remove('hidden');
-  ollamaBtn.classList.toggle('hidden', state !== 'unreachable');
-  recommendationsBtn.classList.toggle('hidden', state !== 'empty');
+  const cloud = provider === 'openai';
+  // Telling someone to install Ollama when they have deliberately configured a
+  // cloud provider is advice for a problem they do not have.
+  ollamaBtn.classList.toggle('hidden', cloud || state !== 'unreachable');
+  recommendationsBtn.classList.toggle('hidden', cloud || state !== 'empty');
+
+  if (cloud) {
+    title.textContent = state === 'unreachable' ? 'CANNOT REACH THE PROVIDER' : 'NO MODELS AVAILABLE';
+    body.innerHTML = '';
+    const explanation = document.createElement('p');
+    explanation.textContent = detail || 'The provider returned no models.';
+    body.appendChild(explanation);
+    const next = document.createElement('p');
+    next.textContent = state === 'unreachable'
+      ? 'Check the endpoint URL and API key in Settings, then try again.'
+      : 'The endpoint answered but listed nothing. Check that the API key has access to any models.';
+    body.appendChild(next);
+    return;
+  }
 
   if (state === 'unreachable') {
     title.textContent = 'NO LOCAL MODEL SERVER FOUND';
@@ -275,29 +413,40 @@ $('onboarding-ollama').addEventListener('click', () => window.api.openOllamaSite
 
 function applySessionDefaults() {
   thinkToggle.checked = appSettings ? !!appSettings[appMode === 'chat' ? 'chatThink' : 'codeThink'] : localStorage.getItem('think') === '1';
-  autoApprove.checked = appSettings ? !!appSettings.autoApprove : localStorage.getItem('autoApprove') === '1';
+  
   autoBranchToggle.checked = appSettings ? !!appSettings.autoBranch : localStorage.getItem('autoBranch') === '1';
   reviewToggle.checked = appSettings ? !!appSettings.reviewMode : localStorage.getItem('reviewMode') === '1';
   sidebar.classList.toggle('hidden', appSettings ? !appSettings.sidebarOpen : false);
   onlineResearchToggle.checked = false; // privacy boundary: never restore online access implicitly
   const preferred = defaultModelForMode(appMode);
   if (preferred && currentModels.includes(preferred)) modelSelect.value = preferred;
+  activeModelPicker?.sync();
+  syncChatLayout();
 }
 
 thinkToggle.addEventListener('change', () => localStorage.setItem('think', thinkToggle.checked ? '1' : '0'));
-autoApprove.addEventListener('change', () => localStorage.setItem('autoApprove', autoApprove.checked ? '1' : '0'));
+
 autoBranchToggle.addEventListener('change', () => localStorage.setItem('autoBranch', autoBranchToggle.checked ? '1' : '0'));
 reviewToggle.addEventListener('change', () => localStorage.setItem('reviewMode', reviewToggle.checked ? '1' : '0'));
-onlineResearchToggle.addEventListener('change', async () => {
-  if (!onlineResearchToggle.checked) return;
-  const approved = await confirmDialog(
+function confirmOnlineResearch() {
+  setCompactOptionsOpen(false);
+  return confirmDialog(
     'Enable ONLINE RESEARCH for this session?\n\nSearch queries and requested page URLs will leave this computer. Every web_search and web_fetch call will still require explicit approval, even when AUTO-APPROVE is on.',
     { okLabel: 'ENABLE' }
   );
-  if (!approved) onlineResearchToggle.checked = false;
+}
+
+onlineResearchToggle.addEventListener('change', async () => {
+  if (onlineResearchToggle.checked) {
+    const approved = await confirmOnlineResearch();
+    if (!approved) onlineResearchToggle.checked = false;
+    compactOptionsButton.focus();
+  }
+  syncChatLayout();
 });
 
 modelSelect.addEventListener('change', () => {
+  syncChatLayout();
   localStorage.setItem('model', modelSelect.value);
   localStorage.setItem(`model:${appMode}`, modelSelect.value);
 });
@@ -311,10 +460,7 @@ function setAppMode(mode, persist = true, refreshHistory = true) {
   chatModeBtn.classList.toggle('active', appMode === 'chat');
   codeModeBtn.setAttribute('aria-pressed', appMode === 'code' ? 'true' : 'false');
   chatModeBtn.setAttribute('aria-pressed', appMode === 'chat' ? 'true' : 'false');
-  $('sidebar-head').textContent = appMode === 'chat' ? 'CHAT HISTORY' : 'CODE HISTORY';
-  input.placeholder = appMode === 'chat'
-    ? 'Ask anything... (Enter to send, Shift+Enter for newline)'
-    : 'Describe a task... (Enter to send, Shift+Enter for newline)';
+  syncChatLayout();
   if (persist) localStorage.setItem('appMode', appMode);
   syncMissionCard();
   refreshGit();
@@ -322,10 +468,10 @@ function setAppMode(mode, persist = true, refreshHistory = true) {
 }
 
 async function chooseAppMode(mode) {
-  if (busy || mode === appMode) return;
-  const conversation = await window.api.getConversation();
+  if (busy || chatSubmitPending || mode === appMode) return;
+  const conversation = hasChatRuns() ? [] : await window.api.getConversation();
   const consequences = [];
-  if (conversation.length) consequences.push('Your current chat is already saved in History.');
+  if (conversation.length || currentChatId) consequences.push('Your current chat is already saved in History.');
   if (pendingPlanDraft) consequences.push('The current plan draft will be cancelled.');
   if (consequences.length && !(await confirmDialog(
     `Switch to ${mode.toUpperCase()} and start a new session?\n\n${consequences.join('\n')}`,
@@ -333,7 +479,7 @@ async function chooseAppMode(mode) {
   ))) return;
   if (pendingPlanDraft) clearPendingPlan();
   setAppMode(mode);
-  if (conversation.length) await newSession();
+  if (conversation.length || currentChatId) await newSession();
   else {
     applySessionDefaults();
     showStartupMessage();
@@ -348,6 +494,33 @@ $('cwd-btn').addEventListener('click', async () => {
 // In-app replacement for window.confirm() — native dialogs break keyboard
 // focus in the renderer on Windows (Electron/Chromium). Returns a promise that
 // resolves true (OK) or false (Cancel). Enter confirms, Escape cancels.
+// Projects that have already acknowledged the unattended-run disclosure. Kept
+// per project so it is a one-time act, not a nag on every run.
+const agentAcknowledged = new Set(JSON.parse(localStorage.getItem('agentAcknowledged') || '[]'));
+
+async function confirmAgentRun(projectPath, policyId) {
+  if (agentAcknowledged.has(projectPath)) return true;
+  const named = policyId || autonomyPolicy;
+  const confirmed = await confirmDialog(
+    'Start an UNATTENDED agent run in this project?\n\n'
+    + `Autonomy policy: ${named}\n\n`
+    + 'With nobody watching, the agent acts on its own: it can run shell commands, '
+    + 'drive a browser, and call connected tools to do things on the web. Some of those '
+    + 'actions cannot be undone, and a Git checkpoint only restores files, not anything '
+    + 'that has left this machine — and in a folder without a Git repository there is no '
+    + 'file-level undo at all.\n\n'
+    + 'Actions the policy does not permit are held in the run\'s review tray rather than '
+    + 'performed. Spending money still requires your approval at the moment it happens.\n\n'
+    + 'You are responsible for what an unattended run does. Continue?',
+    { okLabel: 'RUN UNATTENDED', danger: true }
+  );
+  if (confirmed) {
+    agentAcknowledged.add(projectPath);
+    localStorage.setItem('agentAcknowledged', JSON.stringify([...agentAcknowledged]));
+  }
+  return confirmed;
+}
+
 function confirmDialog(message, { okLabel = 'OK', cancelLabel = 'CANCEL', danger = false } = {}) {
   return new Promise((resolve) => {
     const modal = $('confirm-modal');
@@ -404,7 +577,7 @@ window.api.onCheckpointState(({ available, cwd: ckptCwd }) => {
 });
 
 undoBtn.addEventListener('click', async () => {
-  if (busy || undoBtn.disabled) return;
+  if (busy || hasChatRuns() || undoBtn.disabled) return;
   if (!(await confirmDialog('Restore all files in this folder to the checkpoint taken before the last run?\n\n(The current state is checkpointed first — press UNDO again to re-apply the run.)', { okLabel: 'RESTORE' }))) return;
   const res = await window.api.undoCheckpoint(cwd);
   if (res.ok) {
@@ -416,7 +589,8 @@ undoBtn.addEventListener('click', async () => {
 });
 
 // ---------- REVIEW mode: keep/discard a run ----------
-window.api.onRunReport(({ cwd: runCwd, mutations }) => {
+window.api.onRunReport(({ cwd: runCwd, mutations }, route) => {
+  if (!routeIsVisible(route)) return;
   if (!reviewToggle.checked || !mutations || runCwd !== cwd) return;
   $('review-detail').textContent = `${mutations} file${mutations === 1 ? '' : 's'} changed — keep this run's changes, or discard to restore the pre-run checkpoint.`;
   $('review-bar').classList.remove('hidden');
@@ -447,17 +621,24 @@ $('review-discard-btn').addEventListener('click', async () => {
 
 // ---------- chat history ----------
 async function loadChatHistory() {
+  const request = ++historyRequest;
   const allChats = await window.api.historyList();
-  const chats = allChats.filter((chatEntry) => appMode === 'chat'
+  if (request !== historyRequest) return;
+  historyEntries = allChats;
+  renderChatHistory();
+}
+
+function renderChatHistory() {
+  const chats = window.ChatLayout.filterConversations(historyEntries.filter((chatEntry) => appMode === 'chat'
     ? chatEntry.mode === 'chat'
-    : chatEntry.mode !== 'chat');
+    : chatEntry.mode !== 'chat'), $('chat-search').value);
   chats.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)); // newest first
   chatList.innerHTML = '';
 
   if (chats.length === 0) {
     const noChats = document.createElement('div');
     noChats.className = 'no-chats';
-    noChats.textContent = 'No chats yet';
+    noChats.textContent = $('chat-search').value.trim() ? 'No matching chats' : 'No chats yet';
     chatList.appendChild(noChats);
     return;
   }
@@ -491,12 +672,16 @@ function renderChatItem(c) {
   {
     const item = document.createElement('div');
     item.className = 'chat-item' + (c.id === currentChatId ? ' active' : '');
+    const liveRun = chatRuns.get(c.id);
+    if (liveRun) item.classList.add('running');
+    if (liveRun?.unread || unreadChats.has(c.id)) item.classList.add('unread');
 
     const main = document.createElement('div');
     main.className = 'chat-item-main';
     const title = document.createElement('span');
     title.className = 'chat-title';
     title.textContent = c.title || `Chat ${c.id.substring(0, 8)}`;
+    item.title = [title.textContent, c.cwd, c.model, new Date(c.timestamp).toLocaleString()].filter(Boolean).join('\n');
     const date = document.createElement('span');
     date.className = 'chat-date';
     date.textContent = new Date(c.timestamp).toLocaleString();
@@ -508,18 +693,42 @@ function renderChatItem(c) {
       model.textContent = c.model;
       main.appendChild(model);
     }
+    // Whether this session reached the network is worth seeing before opening
+    // it. This permanent record is separate from the saved switch state.
+    if (c.onlineResearch) {
+      const online = document.createElement('span');
+      online.className = 'chat-online';
+      online.textContent = 'ONLINE';
+      online.title = 'This session ran with online research enabled at some point.';
+      main.appendChild(online);
+    }
+    if (liveRun) {
+      const state = document.createElement('span');
+      state.className = 'chat-run-state';
+      state.textContent = liveRun.state === 'queued' ? 'QUEUED' : 'RUNNING';
+      state.title = liveRun.state === 'queued'
+        ? 'This request will start after the active model run finishes.'
+        : 'The model is working in this chat.';
+      main.appendChild(state);
+    }
 
     const del = document.createElement('button');
     del.className = 'chat-del';
     del.textContent = '✕';
     del.title = 'Delete this chat';
+    del.setAttribute('aria-label', `Delete ${title.textContent}`);
     del.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (await confirmDialog('Delete this chat?', { okLabel: 'DELETE', danger: true })) deleteChat(c.id);
     });
 
-    item.addEventListener('click', () => loadChat(c.id));
-    item.appendChild(main);
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'chat-open';
+    open.setAttribute('aria-current', c.id === currentChatId ? 'page' : 'false');
+    open.appendChild(main);
+    open.addEventListener('click', () => loadChat(c.id));
+    item.appendChild(open);
     item.appendChild(del);
     chatList.appendChild(item);
   }
@@ -529,55 +738,69 @@ async function saveChat() {
   // The live conversation lives in the main process — pull it over IPC.
   const conversation = await window.api.getConversation();
   if (!conversation.length) return;
-  const runMetrics = await window.api.usageGet();
-  const contextRes = await window.api.contextState();
 
-  // Only generate a new title if this is a new chat (no existing title or title is generic)
+  // A saved marker, not the presence of an ID, says whether this chat needs a
+  // title. Some workflows allocate the ID before their first save.
   let title = 'Chat';
+  let autoTitlePending = false;
+  let autoTitleAttempts = 0;
   const firstUser = conversation.find((m) => m.role === 'user');
   const firstUserText = firstUser
     ? firstUser.displayContent || firstUser.attachments?.map((attachment) => attachment.name).join(', ') || firstUser.content || 'Chat'
     : 'Chat';
   const fallbackTitle = firstUserText.substring(0, 30) + (firstUserText.length > 30 ? '...' : '');
   
-  // Check if we should generate a title using the LLM
-  if (!currentChatId || !firstUser) {
-    // Use the new LLM-based title generation
+  const existingRes = currentChatId
+    ? await window.api.historyLoad(currentChatId)
+    : { ok: false };
+  const existingChat = existingRes.ok ? existingRes.chat : null;
+  autoTitleAttempts = Math.max(0, Number(existingChat?.autoTitleAttempts) || 0);
+  const needsTitle = !!firstUser && (!existingChat || existingChat.autoTitlePending);
+
+  if (needsTitle && autoTitleAttempts < 3) {
     try {
       const titleRes = await window.api.generateChatTitle(conversation, modelSelect.value);
       if (titleRes.ok && titleRes.title) {
         title = titleRes.title;
+        autoTitleAttempts += 1;
       } else {
-        // Fallback to old behavior if LLM fails
         title = firstUser ? fallbackTitle : 'Chat';
+        if (!titleRes.aborted) autoTitleAttempts += 1;
+        autoTitlePending = titleRes.aborted || autoTitleAttempts < 3;
       }
     } catch (err) {
-      // Fallback to old behavior if API call fails
       title = firstUser ? fallbackTitle : 'Chat';
+      autoTitleAttempts += 1;
+      autoTitlePending = autoTitleAttempts < 3;
     }
   } else {
-    // For existing chats, keep the existing title
-    const existingChat = await window.api.historyList();
-    const chatEntry = existingChat.find(c => c.id === currentChatId);
-    if (chatEntry && chatEntry.title) {
-      title = chatEntry.title;
+    if (existingChat?.title) {
+      title = existingChat.title;
+      autoTitlePending = !!existingChat.autoTitlePending && autoTitleAttempts < 3;
     } else if (firstUser) {
       title = fallbackTitle;
     }
   }
 
+  // Title inference is part of this saved chat's usage.
+  const runMetrics = await window.api.usageGet();
+  const billing = await window.api.costGet();
+  const contextRes = await window.api.contextState();
   if (!currentChatId) currentChatId = Date.now().toString();
   const res = await window.api.historySave(
     {
       id: currentChatId,
       title,
+      autoTitlePending,
+      autoTitleAttempts,
+      spend: billing.totals,
       model: modelSelect.value,
       mode: appMode,
       cwd: appMode === 'code' ? cwd || '' : '',
       think: thinkToggle.checked,
-      autoApprove: autoApprove.checked,
+      autoApprove: runsUnattended(),
       autoBranch: autoBranchToggle.checked,
-      onlineResearch: onlineResearchToggle.checked,
+      onlineResearchEnabled: onlineResearchToggle.checked,
       subModel,
       coderModel,
       runMetrics,
@@ -591,7 +814,7 @@ async function saveChat() {
 }
 
 async function loadChat(chatId) {
-  if (busy) return;
+  if (busy || chatSubmitPending) return;
   const res = await window.api.historyLoad(chatId);
   if (!res.ok) return addError('Could not load chat: ' + res.error);
   clearPendingPlan();
@@ -599,11 +822,25 @@ async function loadChat(chatId) {
   // Set this before any rendering or mode/directory synchronization so a
   // mission card can never be carried over from the previously open chat.
   currentChatId = chatId;
-  onlineResearchToggle.checked = false; // loading history must never restore network access
+  unreadChats.delete(chatId);
+  const liveRun = chatRuns.get(chatId);
+  if (liveRun) liveRun.unread = false;
+  // Provenance and permission are different facts. Restore the explicit switch
+  // snapshot without asking again. The warning belongs to the action that first
+  // enables ONLINE, not to routine navigation between already-saved chats.
+  onlineResearchToggle.checked = saved.onlineResearchEnabled === true;
+  syncChatLayout();
   setAppMode(saved.mode === 'chat' ? 'chat' : 'code');
 
   // Push the stored conversation into the main process so the model continues from it.
-  const lc = await window.api.loadConversation(saved.conversation, saved.model || modelSelect.value, saved.runMetrics, saved.contextState);
+  const lc = await window.api.loadConversation(saved.conversation, saved.model || modelSelect.value, saved.runMetrics, saved.contextState,
+    {
+      cwd: saved.cwd || cwd,
+      mode: saved.mode === 'chat' ? 'chat' : 'code',
+      onlineResearch: onlineResearchToggle.checked,
+      onlineResearchEverUsed: !!saved.onlineResearch,
+      spend: saved.spend,
+    });
   renderConversation(saved.conversation);
   updateContextBar(lc.approxTokens, lc.contextLength);
   compactWarned = false; // fresh warning budget for this chat
@@ -612,6 +849,8 @@ async function loadChat(chatId) {
   // Auto-select the model this chat was using; if it's gone from Ollama, keep the current one.
   if (saved.model && [...modelSelect.options].some((o) => o.value === saved.model)) {
     modelSelect.value = saved.model;
+    activeModelPicker?.sync();
+    syncChatLayout();
     localStorage.setItem('model', saved.model);
   }
 
@@ -622,7 +861,7 @@ async function loadChat(chatId) {
       setCwd(saved.cwd);
       cwdChanged = true;
     } else {
-      addError(`This chat used ${saved.cwd}, which no longer exists — DIR left unchanged.`);
+      addError(`This chat used ${saved.cwd}, which no longer exists — the project folder is unchanged.`);
     }
   }
 
@@ -631,16 +870,37 @@ async function loadChat(chatId) {
     thinkToggle.checked = !!saved.think;
     localStorage.setItem('think', saved.think ? '1' : '0');
   }
-  if ('autoApprove' in saved) {
-    autoApprove.checked = !!saved.autoApprove;
-    localStorage.setItem('autoApprove', saved.autoApprove ? '1' : '0');
-  }
+
 
   loadChatHistory(); // refresh active highlight
+  syncChatRunControls();
   if (!cwdChanged) refreshGit();
 }
 
+async function syncVisibleChatToMain() {
+  if (!currentChatId || hasChatRuns() || busy) return;
+  const res = await window.api.historyLoad(currentChatId);
+  if (!res.ok) return;
+  const saved = res.chat;
+  const lc = await window.api.loadConversation(
+    saved.conversation || [],
+    saved.model || modelSelect.value,
+    saved.runMetrics,
+    saved.contextState,
+    {
+      cwd: saved.cwd || cwd,
+      mode: saved.mode === 'chat' ? 'chat' : 'code',
+      onlineResearch: onlineResearchToggle.checked,
+      onlineResearchEverUsed: !!saved.onlineResearch,
+      spend: saved.spend,
+    },
+  );
+  if (!lc.deferred) updateContextBar(lc.approxTokens, lc.contextLength);
+}
+
 async function deleteChat(chatId) {
+  if (chatSubmitPending) return;
+  if (chatRuns.has(chatId)) return addError('Stop this chat before deleting it.');
   await window.api.historyDelete(chatId);
   loadChatHistory();
 
@@ -662,17 +922,37 @@ async function deleteChat(chatId) {
 
 function renderConversation(conversation) {
   chat.innerHTML = '';
+  currentAssistant = null;
+  currentAssistantRaw = '';
+  currentThinking = null;
+  currentSubCard = null;
+  lastToolCard = null;
   missionCard = null;
+  const pendingToolCalls = [];
   conversation.forEach((msg, index) => {
+    // Messages the app wrote to itself — the compaction block, a nudge back to
+    // work — are not dialogue. Replaying them with YOU and MODEL labels claims
+    // the user said things they never typed, and buries the real conversation
+    // under bookkeeping. They stay visible, but folded and marked as machinery.
+    if (msg.meta) {
+      addContextBlock(msg);
+      return;
+    }
     if (msg.role === 'user') {
+      pendingToolCalls.length = 0;
       const imgs = (msg.images || []).map((b, i) => `data:${msg.imageTypes?.[i] || 'image/png'};base64,${b}`);
       const shownText = msg.displayContent || (msg.attachments?.length ? '(attached files)' : msg.content) || (imgs.length ? '(image)' : '');
       addMessage('user', shownText, imgs, msg.attachments || [], { message: msg, index });
     } else if (msg.role === 'assistant') {
-      if (msg.thinking) addThinkingBlock(msg.thinking, 'THOUGHTS ▸');
+      if (msg.thinking) addThinkingBlock(msg.thinking, 'Thoughts');
       if (msg.content) renderMarkdown(addMessage('assistant', '', null, [], { message: msg, index }), msg.content);
+      for (const call of msg.tool_calls || []) pendingToolCalls.push(toolCallDetails(call));
     } else if (msg.role === 'tool') {
       const text = String(msg.content);
+      const matchedIndex = pendingToolCalls.findIndex((call) => (
+        (msg.tool_call_id && call.id === msg.tool_call_id) || call.name === msg.tool_name
+      ));
+      const call = matchedIndex >= 0 ? pendingToolCalls.splice(matchedIndex, 1)[0] : null;
       if (msg.tool_name === 'run_subagent') {
         // replay saved subagent reports as collapsed cards, like the live view
         const m = text.match(/^Subagent report \(([^,]+), (\d+) tool calls?\):\n?/);
@@ -690,17 +970,22 @@ function renderConversation(conversation) {
         decorateContextControls(card, msg, index);
         chat.appendChild(card);
       } else {
-        addMessage('tool', `[${msg.tool_name}] ` + (text.length > 300 ? text.slice(0, 300) + '…' : text), null, [], { message: msg, index });
+        const card = addToolCard(msg.tool_name || call?.name || 'tool', call?.args || {}, { message: msg, index });
+        finishToolCard(card, text, { denied: /denied by user|deferred by policy|parked/i.test(text) });
       }
     }
   });
   if (latestMission) upsertMissionCard(latestMission);
+  settleAtChatBottom();
 }
 
 // ---------- attachments ----------
 const MAX_ATTACHMENTS = 6;
 const MAX_ATTACHMENT_SIZE = 15 * 1024 * 1024;
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const IMAGE_TYPE_BY_EXTENSION = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+};
 const DOCUMENT_EXTENSIONS = new Set([
   'pdf', 'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'jsonl', 'yaml', 'yml',
   'xml', 'html', 'htm', 'css', 'scss', 'less', 'js', 'mjs', 'cjs', 'jsx', 'ts',
@@ -709,26 +994,70 @@ const DOCUMENT_EXTENSIONS = new Set([
   'log', 'properties',
 ]);
 let pendingImages = []; // { name, type, size, dataUrl }
-let pendingFiles = []; // { name, type, size, dataUrl }
+let pendingFiles = []; // { name, type, size, path, dataUrl }
+let pendingAttachmentReads = 0;
 
 $('attach-btn').addEventListener('click', () => $('attach-file').click());
 
 $('attach-file').addEventListener('change', (e) => {
-  for (const file of e.target.files) addAttachment(file);
+  addAttachments(e.target.files);
   e.target.value = '';
 });
 
 input.addEventListener('paste', (e) => {
-  for (const item of e.clipboardData.items) {
-    if (item.type.startsWith('image/')) {
-      e.preventDefault();
-      addAttachment(item.getAsFile());
-    }
-  }
+  const images = Array.from(e.clipboardData?.items || [])
+    .filter((item) => item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  if (!images.length) return;
+  e.preventDefault();
+  addAttachments(images);
 });
+
+// Dropping a file on an Electron page normally navigates the window to that
+// file. Capture file drags at the document boundary, show one clear target,
+// and feed the files into the same path as the ATTACH button and paste.
+const attachmentDropOverlay = $('attachment-drop-overlay');
+function showAttachmentDropOverlay(visible) {
+  attachmentDropOverlay.classList.toggle('hidden', !visible);
+  attachmentDropOverlay.setAttribute('aria-hidden', String(!visible));
+}
+
+document.addEventListener('dragenter', (e) => {
+  if (!window.AttachmentDrop.hasFilePayload(e.dataTransfer)) return;
+  e.preventDefault();
+  showAttachmentDropOverlay(true);
+});
+
+document.addEventListener('dragover', (e) => {
+  if (!window.AttachmentDrop.hasFilePayload(e.dataTransfer)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  showAttachmentDropOverlay(true);
+});
+
+document.addEventListener('dragleave', (e) => {
+  if (e.relatedTarget && document.documentElement.contains(e.relatedTarget)) return;
+  showAttachmentDropOverlay(false);
+});
+
+document.addEventListener('drop', (e) => {
+  if (!window.AttachmentDrop.hasFilePayload(e.dataTransfer)) return;
+  e.preventDefault();
+  showAttachmentDropOverlay(false);
+  addAttachments(window.AttachmentDrop.filesFromTransfer(e.dataTransfer));
+  input.focus();
+});
+
+window.addEventListener('blur', () => showAttachmentDropOverlay(false));
+window.addEventListener('dragend', () => showAttachmentDropOverlay(false));
 
 function attachmentCount() {
   return pendingImages.length + pendingFiles.length;
+}
+
+function attachmentSlotsUsed() {
+  return attachmentCount() + pendingAttachmentReads;
 }
 
 function fileExtension(name) {
@@ -738,24 +1067,53 @@ function fileExtension(name) {
 
 function addAttachment(file) {
   if (!file) return;
-  if (attachmentCount() >= MAX_ATTACHMENTS) return addError(`Attach at most ${MAX_ATTACHMENTS} files at once.`);
+  if (attachmentSlotsUsed() >= MAX_ATTACHMENTS) return addError(`Attach at most ${MAX_ATTACHMENTS} files at once.`);
   if (!file.size) return addError(`${file.name || 'Attachment'} is empty.`);
   if (file.size > MAX_ATTACHMENT_SIZE) return addError(`${file.name || 'Attachment'} is larger than 15 MB.`);
-  const isImage = IMAGE_TYPES.has(file.type);
-  const isDocument = file.type === 'application/pdf' || file.type.startsWith('text/') || DOCUMENT_EXTENSIONS.has(fileExtension(file.name));
+  const fileType = String(file.type || '').toLowerCase();
+  const inferredImageType = IMAGE_TYPE_BY_EXTENSION[fileExtension(file.name)] || '';
+  const imageType = IMAGE_TYPES.has(fileType) ? fileType : inferredImageType;
+  const isImage = !!imageType;
+  const isDocument = fileType === 'application/pdf' || fileType.startsWith('text/') || DOCUMENT_EXTENSIONS.has(fileExtension(file.name));
   if (!isImage && !isDocument) return addError(`${file.name || 'Attachment'} is not a supported image, PDF, text, or code file.`);
   const reader = new FileReader();
+  pendingAttachmentReads += 1;
+  renderAttachmentPreview();
   reader.onload = () => {
     const attachment = {
       name: file.name || (isImage ? 'pasted-image' : 'attachment'),
-      type: file.type || (fileExtension(file.name) === 'pdf' ? 'application/pdf' : 'text/plain'),
+      // Where the file actually lives, when it came from disk. Empty for a
+      // paste. This is what lets an edited PDF be written back beside the
+      // original rather than somewhere the user has to go hunting for.
+      path: (window.api.filePathFor && window.api.filePathFor(file)) || '',
+      type: imageType || fileType || (fileExtension(file.name) === 'pdf' ? 'application/pdf' : 'text/plain'),
       size: file.size,
       dataUrl: reader.result,
     };
     (isImage ? pendingImages : pendingFiles).push(attachment);
+  };
+  reader.onerror = () => addError(`${file.name || 'Attachment'} could not be read.`);
+  reader.onloadend = () => {
+    pendingAttachmentReads = Math.max(0, pendingAttachmentReads - 1);
     renderAttachmentPreview();
   };
-  reader.readAsDataURL(file);
+  try {
+    reader.readAsDataURL(file);
+  } catch (error) {
+    pendingAttachmentReads = Math.max(0, pendingAttachmentReads - 1);
+    renderAttachmentPreview();
+    addError(`${file.name || 'Attachment'} could not be read: ${error.message || error}`);
+  }
+}
+
+function addAttachments(files) {
+  for (const file of Array.from(files || [])) {
+    if (attachmentSlotsUsed() >= MAX_ATTACHMENTS) {
+      addError(`Attach at most ${MAX_ATTACHMENTS} files at once.`);
+      break;
+    }
+    addAttachment(file);
+  }
 }
 
 function formatFileSize(bytes) {
@@ -767,7 +1125,7 @@ function formatFileSize(bytes) {
 function renderAttachmentPreview() {
   const strip = $('attachment-preview');
   strip.innerHTML = '';
-  strip.classList.toggle('hidden', !attachmentCount());
+  strip.classList.toggle('hidden', !attachmentCount() && !pendingAttachmentReads);
   pendingImages.forEach((attachment, index) => {
     const wrap = document.createElement('div');
     wrap.className = 'img-thumb';
@@ -802,6 +1160,12 @@ function renderAttachmentPreview() {
     chip.appendChild(remove);
     strip.appendChild(chip);
   });
+  if (pendingAttachmentReads) {
+    const loading = document.createElement('div');
+    loading.className = 'file-chip attachment-loading';
+    loading.textContent = `Adding ${pendingAttachmentReads} attachment${pendingAttachmentReads === 1 ? '' : 's'}…`;
+    strip.appendChild(loading);
+  }
 }
 
 // ---------- sending ----------
@@ -812,21 +1176,30 @@ input.addEventListener('keydown', (e) => {
   }
 });
 sendBtn.addEventListener('click', send);
-stopBtn.addEventListener('click', () => window.api.stop());
+stopBtn.addEventListener('click', () => {
+  const run = currentChatRun();
+  window.api.stop(run ? { chatId: currentChatId, runId: run.runId } : undefined);
+});
 
 async function send() {
   const text = input.value.trim();
   const missionControl = /^\/mission\s+(?:status|stop|resume)\s*$/i.test(text);
-  if ((!text && !attachmentCount()) || (busy && !missionControl)) return;
+  if (pendingAttachmentReads) return addError('Wait for the attachment to finish loading.');
+  if ((!text && !attachmentCount()) || chatSubmitPending || currentChatRun() || (busy && !missionControl)) return;
   if (text.startsWith('/')) {
+    if (hasChatRuns()) return addError('Wait for the active or queued chat requests to finish before using commands.');
     input.value = '';
     if (text === '/help' || text.includes('/auto') || text.includes('/commit') || text.includes('/model') || text.includes('/subagent') || text.includes('/coder') || text.includes('/plan') || text.includes('/review') || text.includes('/orchestrate') || text.includes('/mission') || text.includes('/mcp')) {
       hideStartupMessage();
     }
     return handleSlash(text);
   }
-  if (!modelSelect.value) return addError('No model selected — is Ollama running?');
-  if (appMode === 'code' && !cwd) return addError('Pick a working directory first (DIR button, top left).');
+  if (!modelSelect.value) {
+    return addError(appSettings.provider === 'openai'
+      ? 'No model selected — check the provider catalog, endpoint, and API key.'
+      : 'No model selected — check that the local model server is running.');
+  }
+  if (appMode === 'code' && !cwd) return addError('Choose a project folder below the model selector first.');
 
   // Ollama wants raw base64 without the data-URL prefix
   const images = pendingImages.map((attachment) => attachment.dataUrl.split(',')[1]);
@@ -836,6 +1209,7 @@ async function send() {
     name: attachment.name,
     type: attachment.type,
     size: attachment.size,
+    path: attachment.path || '',
     data: attachment.dataUrl.split(',')[1],
   }));
   const shownImages = pendingImages.map((attachment) => attachment.dataUrl);
@@ -843,41 +1217,53 @@ async function send() {
     ...pendingImages.map(({ name, type, size }) => ({ name, type, size, kind: 'image' })),
     ...pendingFiles.map(({ name, type, size }) => ({ name, type, size, kind: type === 'application/pdf' ? 'pdf' : 'text' })),
   ];
+  if (!currentChatId) currentChatId = newIdentity('chat');
+  const runChatId = currentChatId;
+  const runId = newIdentity('run');
+  chatSubmitPending = true;
+  sendBtn.disabled = true;
+  let res;
+  try {
+    res = await window.api.send({
+      chatId: runChatId,
+      runId,
+      model: modelSelect.value,
+      subModel,
+      text,
+      mode: appMode,
+      cwd: appMode === 'code' ? cwd : null,
+      autoApprove: appMode === 'code' && runsUnattended(),
+      autoBranch: appMode === 'code' && autoBranchToggle.checked,
+      onlineResearch: onlineResearchToggle.checked,
+      think: thinkToggle.checked,
+      images,
+      imageTypes,
+      imageAttachments,
+      files,
+      history: {
+        title: text ? (text.length > 30 ? text.slice(0, 30) + '...' : text) : shownAttachments.map((entry) => entry.name).join(', '),
+        think: thinkToggle.checked,
+        autoApprove: runsUnattended(),
+        coderModel,
+        contextState: { projectPath: '', pinnedFiles: [] },
+      },
+    });
+  } catch (error) {
+    res = { ok: false, error: String(error.message || error) };
+  } finally {
+    chatSubmitPending = false;
+    sendBtn.disabled = false;
+  }
+
+  if (!res.ok) return addError(res.error);
   pendingImages = [];
   pendingFiles = [];
   renderAttachmentPreview();
-
   input.value = '';
   hideStartupMessage();
   addMessage('user', text || '(attached files)', shownImages, shownAttachments);
-  startRun();
-
-  const res = await window.api.send({
-    model: modelSelect.value,
-    subModel,
-    text,
-    mode: appMode,
-    cwd: appMode === 'code' ? cwd : null,
-    autoApprove: appMode === 'code' && autoApprove.checked,
-    autoBranch: appMode === 'code' && autoBranchToggle.checked,
-    onlineResearch: onlineResearchToggle.checked,
-    think: thinkToggle.checked,
-    images,
-    imageTypes,
-    imageAttachments,
-    files,
-  });
-
-  if (!res.ok) addError(res.error);
-
-  // Save before accepting another send so two first-message saves cannot race.
-  try {
-    await saveChat();
-  } catch (err) {
-    addError('Failed to save chat: ' + (err.message || err));
-  } finally {
-    endRun();
-  }
+  setChatRun(runChatId, res.runId || runId, res.queued ? 'queued' : 'running');
+  if (res.queued) addInfo('Request queued. It will start when the active model run finishes.');
 }
 
 function startRun() {
@@ -904,11 +1290,12 @@ function endRun() {
   setState('idle');
   clearInterval(elapsedTimer);
   refreshGit(); // the run may have changed files
+  syncChatRunControls();
 }
 
 function setState(s) {
   const el = $('status-state');
-  el.textContent = s;
+  el.textContent = s === 'idle' ? 'Ready' : s;
   el.classList.toggle('working', s !== 'idle');
 }
 
@@ -923,7 +1310,11 @@ let mdRenderQueued = false;
 // Render markdown safely. Falls back to plain text if the libs failed to load.
 function renderMarkdown(el, text) {
   if (window.marked && window.DOMPurify) {
-    el.innerHTML = DOMPurify.sanitize(marked.parse(text, { async: false }));
+    const protectedMath = window.MathRenderer
+      ? window.MathRenderer.protectMath(text)
+      : { text, segments: [] };
+    el.innerHTML = DOMPurify.sanitize(marked.parse(protectedMath.text, { async: false }));
+    window.MathRenderer?.renderProtectedMath(el, protectedMath.segments, window.katex);
     el.classList.add('md'); // switches white-space handling from pre-wrap to normal
   } else {
     el.textContent = text;
@@ -952,6 +1343,26 @@ function scheduleMarkdownRender() {
     renderMarkdown(currentAssistant, currentAssistantRaw);
     if (nearBottom) scrollDown();
   });
+}
+
+// Bookkeeping the app inserted into the transcript, folded away by default.
+const META_LABELS = {
+  compaction: 'CONTEXT — earlier conversation compacted',
+  nudge: 'CONTEXT — the app prompted the model to continue',
+};
+
+function addContextBlock(msg) {
+  const details = document.createElement('details');
+  details.className = 'msg info context-block';
+  const summary = document.createElement('summary');
+  summary.textContent = META_LABELS[msg.meta] || 'CONTEXT';
+  details.appendChild(summary);
+  const body = document.createElement('div');
+  body.className = 'context-block-body';
+  renderMarkdown(body, String(msg.content || ''));
+  details.appendChild(body);
+  chat.appendChild(details);
+  return details;
 }
 
 function addMessage(role, text, images, attachments = [], context = null) {
@@ -996,11 +1407,55 @@ function addMessage(role, text, images, attachments = [], context = null) {
   return body;
 }
 
+function toolCallDetails(call = {}) {
+  const name = call.function?.name || call.name || '';
+  let args = call.function?.arguments ?? call.arguments ?? {};
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = {}; }
+  }
+  return { id: call.id || '', name, args: args && typeof args === 'object' ? args : {} };
+}
+
+function addToolCard(name, args = {}, context = null) {
+  const displayName = window.ToolNames ? window.ToolNames.displayToolName(name) : name;
+  const card = document.createElement('div');
+  card.className = 'tool';
+  card.dataset.tool = name;
+  const head = document.createElement('div');
+  head.className = 'tool-head';
+  head.innerHTML = '<span></span><span class="args"></span><span class="status">running…</span>';
+  const nameEl = head.firstElementChild;
+  nameEl.textContent = displayName;
+  nameEl.title = name;
+  head.querySelector('.args').textContent = shortArgs(name, args);
+  head.addEventListener('click', () => {
+    if (card.classList.contains('has-result')) card.classList.toggle('collapsed');
+  });
+  card.appendChild(head);
+  if (context) decorateContextControls(card, context.message, context.index);
+  chat.appendChild(card);
+  return card;
+}
+
+function finishToolCard(card, result, { denied = false } = {}) {
+  if (!card) return;
+  card.classList.add(denied ? 'denied' : 'ok', 'has-result');
+  card.querySelector('.status').textContent = denied ? 'denied' : 'done';
+  const pre = document.createElement('pre');
+  pre.textContent = result;
+  card.appendChild(pre);
+  // Tool output is supporting detail. Keep it available on click, but never
+  // let browser snapshots, command logs, or error text expand the transcript
+  // automatically when a chat is loaded or a tool finishes.
+  card.classList.add('collapsed');
+}
+
 function decorateContextControls(element, message, index) {
   if (!message || !Number.isInteger(index)) return;
   const canPin = message.role === 'user' || message.role === 'assistant';
   const canExclude = message.role === 'tool';
   if (!canPin && !canExclude) return;
+  element.classList.add('has-context-actions');
   element.classList.toggle('context-pinned', !!message.pinned);
   element.classList.toggle('context-excluded', !!message.excludedFromInference);
   const actions = document.createElement('span');
@@ -1012,7 +1467,7 @@ function decorateContextControls(element, message, index) {
     button.title = title;
     button.addEventListener('click', async (event) => {
       event.stopPropagation();
-      if (busy) return addError('Wait for the current run to finish before changing context controls.');
+      if (busy || hasChatRuns()) return addError('Wait for active and queued runs to finish before changing context controls.');
       const nextValue = !currentValue();
       const result = await window.api.contextControl({ action, index, value: nextValue });
       if (!result.ok) return addError(result.error);
@@ -1046,8 +1501,129 @@ function addInfo(text) {
   scrollDown();
 }
 
+// Decision J: the log renders inline as one foldable block per run rather than
+// as a panel. It costs far less UI, sits next to the run it describes, and
+// survives a history reload for free.
+function addDecisionLog({ runId, policy, decisions = [], deferred = [], parked = [], reportPath, transcriptPath }) {
+  const counts = decisions.reduce((totals, entry) => {
+    totals[entry.verdict] = (totals[entry.verdict] || 0) + 1;
+    return totals;
+  }, {});
+  const summary = Object.entries(counts).map(([verdict, count]) => `${count} ${verdict}`).join(' · ') || 'no tool calls';
+
+  const details = document.createElement('details');
+  details.className = 'msg info decision-log';
+  const heading = document.createElement('summary');
+  const undecided = parked.filter((entry) => !entry.decision).length;
+  heading.textContent = `AGENT RUN — ${policy} — ${summary}`
+    + (deferred.length ? ` — ${deferred.length} needs review` : '')
+    + (undecided ? ` — ${undecided} parked (/pending)` : '');
+  details.appendChild(heading);
+
+  const body = document.createElement('div');
+  if (parked.length) {
+    const tray = document.createElement('div');
+    tray.className = 'needs-review';
+    tray.textContent = 'Parked — the run is suspended until you decide (/pending):';
+    const list = document.createElement('ul');
+    for (const entry of parked) {
+      const item = document.createElement('li');
+      item.textContent = `${entry.name}${entry.target ? ` on ${entry.target}` : ''} — ${entry.reason}${entry.decision ? ` (${entry.decision})` : ''}`;
+      list.appendChild(item);
+    }
+    tray.appendChild(list);
+    body.appendChild(tray);
+  }
+  if (deferred.length) {
+    const tray = document.createElement('div');
+    tray.className = 'needs-review';
+    tray.textContent = 'Not permitted for this unattended run:';
+    const list = document.createElement('ul');
+    for (const entry of deferred) {
+      const item = document.createElement('li');
+      item.textContent = `${entry.name}${entry.target ? ` on ${entry.target}` : ''} — ${entry.reason}`;
+      list.appendChild(item);
+    }
+    tray.appendChild(list);
+    body.appendChild(tray);
+  }
+
+  const log = document.createElement('pre');
+  log.textContent = decisions
+    .map((entry) => `${entry.verdict.padEnd(9)} ${entry.name}${entry.target ? ` ${entry.target}` : ''}`)
+    .join('\n') || '(no tool calls)';
+  body.appendChild(log);
+
+  for (const [label, value] of [['Report', reportPath], ['Transcript', transcriptPath]]) {
+    if (!value) continue;
+    const line = document.createElement('div');
+    line.className = 'decision-log-path';
+    line.textContent = `${label}: ${value}`;
+    body.appendChild(line);
+  }
+
+  details.appendChild(body);
+  details.dataset.runId = runId;
+  chat.appendChild(details);
+  scrollDown();
+}
+
+$('setting-provider')?.addEventListener('change', () => syncProviderFields({ useDefaultEndpoint: true }));
+$('settings-save-key')?.addEventListener('click', async () => {
+  const field = $('setting-api-key');
+  const res = await window.api.providerSetKey(field.value);
+  field.value = '';
+  if (!res.ok) { $('settings-key-status').textContent = res.error; return; }
+  await syncProviderFields();
+});
+$('settings-save-jev-key')?.addEventListener('click', async () => {
+  const field = $('setting-jev-key');
+  const res = await window.api.jevSetKey(field.value);
+  field.value = '';
+  if (!res.ok) { $('settings-jev-key-status').textContent = res.error; return; }
+  await syncJevFields();
+});
+
+// What the turn cost, as a quiet line under the answer. Only ever sent on a
+// cloud provider, so its presence is the signal — the renderer does not need to
+// know which provider is selected.
+window.api.onTurnCost(({ text, sessionText }, route) => {
+  if (!routeIsVisible(route)) return;
+  const line = document.createElement('div');
+  line.className = 'msg info turn-cost';
+  line.textContent = text;
+  line.title = sessionText || '';
+  chat.appendChild(line);
+  scrollDown();
+});
+
+window.api.onRunDecisions((decision, route) => {
+  if (routeIsVisible(route)) addDecisionLog(decision);
+});
+
+// A run someone started from Discord or a trigger drives this window's output
+// but not its controls, so without this the app sits at "idle" while text
+// streams in, and the input stays enabled for a send that will be refused.
+window.api.onExternalRun(({ active, origin, goal }) => {
+  if (active) {
+    startRun();
+    setState(`${origin === 'heartbeat' ? 'heartbeat' : origin === 'trigger' ? 'trigger' : 'remote'} run`);
+    addInfo(`A run started from ${origin === 'remote' ? 'Discord' : origin}: ${goal}`);
+  } else {
+    endRun();
+  }
+});
+
 function scrollDown() {
   chat.scrollTop = chat.scrollHeight;
+}
+
+// Rebuilding a saved transcript adds Markdown height after each message is
+// inserted. Scroll once now and once after browser layout so completed and
+// resumed chats stay on their newest content.
+function settleAtChatBottom() {
+  scrollDown();
+  requestAnimationFrame(scrollDown);
 }
 
 // ---------- thinking display ----------
@@ -1071,14 +1647,15 @@ function addThinkingBlock(text, label) {
 function finalizeThinking() {
   if (!currentThinking) return;
   const secs = ((Date.now() - currentThinking.start) / 1000).toFixed(1);
-  currentThinking.head.textContent = `THOUGHT FOR ${secs}S ▸`;
+  currentThinking.head.textContent = `Thought for ${secs}s`;
   currentThinking.wrap.classList.remove('live');
   currentThinking = null;
 }
 
-window.api.onThinking((t) => {
+window.api.onThinking((t, route) => {
+  if (!routeIsVisible(route)) return;
   if (!currentThinking) {
-    const block = addThinkingBlock('', 'THINKING… ▸');
+    const block = addThinkingBlock('', 'Thinking…');
     block.wrap.classList.add('live');
     currentThinking = { ...block, start: Date.now() };
   }
@@ -1087,15 +1664,22 @@ window.api.onThinking((t) => {
 });
 
 // info notices pushed from main (loop progress, verifier verdicts, auto-compact)
-window.api.onInfo((text) => addInfo(text));
+window.api.onInfo((text, route) => {
+  if (routeIsVisible(route)) addInfo(text);
+  else if (route?.chatId) markChatRunState(route, 'running');
+});
 
 // status-bar state pushed from main (loop iteration, verifying, compacting)
-window.api.onState((text) => setState(text));
+window.api.onState((text, route) => {
+  if (route?.chatId) markChatRunState(route, 'running');
+  if (routeIsVisible(route)) setState(text);
+});
 
 // ---------- subagent cards ----------
 let currentSubCard = null;
 
-window.api.onSubagent((d) => {
+window.api.onSubagent((d, route) => {
+  if (!routeIsVisible(route)) return;
   if (d.phase === 'start') {
     finalizeThinking();
     finalizeAssistant();
@@ -1123,7 +1707,9 @@ window.api.onSubagent((d) => {
     scrollDown();
   } else if (d.phase === 'tool' && currentSubCard) {
     const line = document.createElement('div');
-    line.textContent = '· ' + d.name + '  ' + shortArgs(d.name, d.args || {});
+    const subDisplay = window.ToolNames ? window.ToolNames.displayToolName(d.name) : d.name;
+    line.textContent = '· ' + subDisplay + '  ' + shortArgs(d.name, d.args || {});
+    line.title = d.name;
     currentSubCard.querySelector('.sub-log').appendChild(line);
     scrollDown();
   } else if (d.phase === 'done' && currentSubCard) {
@@ -1140,7 +1726,8 @@ window.api.onSubagent((d) => {
 
 // The fallback tool-call parser recovered calls from raw markup that already
 // streamed into the current bubble — swap in the cleaned text (or drop the bubble).
-window.api.onCleanContent((text) => {
+window.api.onCleanContent((text, route) => {
+  if (!routeIsVisible(route)) return;
   if (!currentAssistant) return;
   if (text) {
     currentAssistantRaw = text;
@@ -1153,49 +1740,33 @@ window.api.onCleanContent((text) => {
 });
 
 // ---------- stream events ----------
-window.api.onToken((t) => {
+window.api.onToken((t, route) => {
+  if (!routeIsVisible(route)) return;
   finalizeThinking();
   if (!currentAssistant) { currentAssistant = addMessage('assistant', ''); currentAssistantRaw = ''; }
   currentAssistantRaw += t;
   scheduleMarkdownRender(); // live markdown, rather than raw text until the run ends
 });
 
-window.api.onToolCall(({ name, args }) => {
+window.api.onToolCall(({ name, args }, route) => {
+  if (!routeIsVisible(route)) return;
   finalizeThinking();
   finalizeAssistant(); // markdown-render the finished bubble; next tokens start a fresh one
   toolCount++;
   $('tool-count').textContent = String(toolCount);
-  setState('tool: ' + name);
-
-  const card = document.createElement('div');
-  card.className = 'tool';
-  card.dataset.tool = name;
-  const head = document.createElement('div');
-  head.className = 'tool-head';
-  head.innerHTML = `<span>${name}</span><span class="args"></span><span class="status">running…</span>`;
-  head.querySelector('.args').textContent = shortArgs(name, args);
-  head.addEventListener('click', () => {
-    if (card.classList.contains('has-result')) card.classList.toggle('collapsed');
-  });
-  card.appendChild(head);
-  chat.appendChild(card);
-  lastToolCard = card;
+  const displayName = window.ToolNames ? window.ToolNames.displayToolName(name) : name;
+  setState('tool: ' + displayName);
+  lastToolCard = addToolCard(name, args);
   scrollDown();
 });
 
 let lastToolCard = null;
 
-window.api.onToolResult(({ result, denied }) => {
+window.api.onToolResult(({ result, denied }, route) => {
+  if (!routeIsVisible(route)) return;
   setState('working');
   if (!lastToolCard) return;
-  lastToolCard.classList.add(denied ? 'denied' : 'ok', 'has-result');
-  lastToolCard.querySelector('.status').textContent = denied ? 'denied' : 'done';
-  const pre = document.createElement('pre');
-  pre.textContent = result;
-  lastToolCard.appendChild(pre);
-  // collapse successful results; leave failures visible
-  const looksBad = denied || /error|traceback|exception|failed|timed out|not found|denied/i.test(String(result).slice(0, 300));
-  if (!looksBad) lastToolCard.classList.add('collapsed');
+  finishToolCard(lastToolCard, result, { denied });
   scrollDown();
 });
 
@@ -1213,19 +1784,50 @@ function updateContextBar(contextTokens, contextLength) {
   fill.id = 'ctx-fill';
 }
 
-window.api.onStats(({ contextTokens, contextLength, tokPerSec, scope }) => {
-  updateContextBar(contextTokens, contextLength);
+window.api.onStats(({ contextTokens, contextLength, tokPerSec, scope }, route) => {
+  if (!routeIsVisible(route)) return;
+  // The bar is the current persisted conversation. Provider and planner
+  // samples describe one short-lived inference and can decrease because of
+  // cache reuse or missing usage fields.
+  const isConversation = scope === 'conversation' || !scope;
+  if (isConversation) updateContextBar(contextTokens, contextLength);
   if (tokPerSec) $('tok-speed').textContent = tokPerSec.toFixed(1) + ' t/s';
-  // Planner context is short-lived and discarded after /orchestrate. Warn only
-  // when the persisted conversation itself needs compaction.
-  if (scope !== 'planner' && appSettings?.autoCompact === false && !compactWarned && contextTokens / contextLength > 0.8) {
+  // Provider and planner context is short-lived. Warn only when the persisted
+  // conversation itself needs compaction.
+  if (isConversation && appSettings?.autoCompact === false && !compactWarned && contextTokens / contextLength > 0.8) {
     compactWarned = true;
     addInfo('Context is over 80% full — run /compact soon or the model will start losing the oldest messages (including its instructions).');
   }
 });
 
-window.api.onDone(() => {
+window.api.onDone(async (result, route) => {
+  if (route?.chatId) {
+    const run = chatRuns.get(route.chatId);
+    if (!run || (route.runId && run.runId !== route.runId)) return;
+    chatRuns.delete(route.chatId);
+    if (route.chatId !== currentChatId) unreadChats.add(route.chatId);
+    await loadChatHistory();
+    if (route.chatId === currentChatId) {
+      const saved = await window.api.historyLoad(route.chatId);
+      if (saved.ok) {
+        renderConversation(saved.chat.conversation || []);
+        const savedContext = saved.chat.runMetrics?.context;
+        if (savedContext?.limit) updateContextBar(savedContext.tokens || 0, savedContext.limit);
+      }
+      if (result && !result.ok) addError(result.error || 'The model run failed.');
+      syncChatRunControls();
+      refreshGit();
+    } else if (!hasChatRuns()) {
+      if (currentChatId) await syncVisibleChatToMain();
+      else await window.api.reset();
+    }
+    return;
+  }
   if (busy) setState('idle');
+  else if (!hasChatRuns()) {
+    if (currentChatId) await syncVisibleChatToMain();
+    else await window.api.reset();
+  }
 });
 
 function missionStatusText(mission) {
@@ -1332,7 +1934,7 @@ async function runApprovedPlan(plan) {
       subModel,
       goal: draft.goal,
       cwd: draft.cwd,
-      autoApprove: autoApprove.checked,
+      autoApprove: runsUnattended(),
       onlineResearch: draft.onlineResearch,
       think: thinkToggle.checked,
       plan,
@@ -1393,9 +1995,10 @@ function shortArgs(name, args) {
 // ---------- approvals ----------
 let pendingApprovalId = null;
 
-window.api.onApprovalRequest(({ id, name, args, network, sensitive, destructive }) => {
+window.api.onApprovalRequest(({ id, name, args, network, sensitive, destructive, financial }) => {
   pendingApprovalId = id;
-  $('approval-tool').textContent = (network ? 'ONLINE REQUEST — ' : sensitive ? 'SENSITIVE READ — ' : destructive ? 'DESTRUCTIVE — ' : 'APPROVE ') + name.toUpperCase() + '?';
+  const approvalDisplay = window.ToolNames ? window.ToolNames.displayToolName(name) : name;
+  $('approval-tool').textContent = (financial ? '💳 SPENDING — ' : network ? 'ONLINE REQUEST — ' : sensitive ? 'SENSITIVE READ — ' : destructive ? 'DESTRUCTIVE — ' : 'APPROVE ') + approvalDisplay.toUpperCase() + '?';
   $('approval-detail').textContent =
     name === 'web_search' ? `This query will be sent to DuckDuckGo:\n\n${args.query}\n\nDomains: ${(args.allowed_domains || []).join(', ') || '(unrestricted)'}`
     : name === 'web_fetch' ? `This public URL will be requested and its text returned to the model:\n\n${args.url}`
@@ -1408,6 +2011,10 @@ window.api.onApprovalRequest(({ id, name, args, network, sensitive, destructive 
     : name === 'edit_file' ? `${args.path}\n\n- ${String(args.old_string || '').slice(0, 300)}\n+ ${String(args.new_string || '').slice(0, 300)}`
     : args.source ? `${args.source} → ${args.destination}`
     : String(args.path || JSON.stringify(args));
+  if (financial) {
+    $('approval-detail').textContent = 'This call looks like it moves money — approve only if you intend to spend.\n\n'
+      + $('approval-detail').textContent;
+  }
   $('approval-bar').classList.remove('hidden');
   setState('awaiting approval');
 });
@@ -1548,13 +2155,53 @@ function hideStartupMessage() {
 }
 
 // ---------- event listeners ----------
-$('history-btn').addEventListener('click', () => {
+// The pressed toggle disappears, so focus moves to its twin. A mouse click
+// (detail > 0) moves focus without the keyboard ring.
+$('history-btn').addEventListener('click', (event) => {
   sidebar.classList.toggle('hidden');
+  syncChatLayout();
+  if (sidebar.classList.contains('hidden')) $('history-open-btn').focus({ focusVisible: event.detail === 0 });
+});
+$('history-open-btn').addEventListener('click', (event) => {
+  sidebar.classList.remove('hidden');
+  syncChatLayout();
+  $('history-btn').focus({ focusVisible: event.detail === 0 });
+});
+$('chat-search').addEventListener('input', renderChatHistory);
+
+const compactOptions = $('compact-options');
+const compactOptionsButton = $('compact-options-btn');
+const compactOptionsMenu = $('compact-options-menu');
+function setCompactOptionsOpen(open) {
+  compactOptions.classList.toggle('open', open);
+  compactOptionsButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+  compactOptionsMenu.inert = !open;
+  if (open) {
+    const bounds = compactOptionsButton.getBoundingClientRect();
+    compactOptionsMenu.style.top = '';
+    compactOptionsMenu.style.bottom = `${Math.round(window.innerHeight - bounds.top + 8)}px`;
+    compactOptionsMenu.style.right = `${Math.max(12, Math.round(window.innerWidth - bounds.right))}px`;
+    compactOptionsMenu.style.maxHeight = `${Math.max(120, bounds.top - topbar.getBoundingClientRect().bottom - 16)}px`;
+  }
+}
+window.addEventListener('resize', () => {
+  if (compactOptions.classList.contains('open')) setCompactOptionsOpen(true);
+});
+compactOptionsButton.addEventListener('click', (event) => {
+  event.stopPropagation();
+  setCompactOptionsOpen(!compactOptions.classList.contains('open'));
+});
+document.addEventListener('click', (event) => {
+  if (!compactOptions.contains(event.target)) {
+    setCompactOptionsOpen(false);
+  }
 });
 
 async function newSession() {
-  if (busy) return;
-  await window.api.reset();
+  if (busy || chatSubmitPending) return;
+  // A background chat owns main's live conversation until its run finishes.
+  // Starting another visible chat must not reset that state from underneath it.
+  if (!hasChatRuns()) await window.api.reset();
   clearPendingPlan(false);
   compactWarned = false;
   chat.innerHTML = '';
@@ -1567,6 +2214,7 @@ async function newSession() {
   setState('idle');
   currentChatId = null;
   applySessionDefaults();
+  syncChatRunControls();
   loadChatHistory(); // clear active highlight
   showStartupMessage();
 }
@@ -1574,6 +2222,7 @@ async function newSession() {
 $('new-btn').addEventListener('click', newSession);
 
 async function showSettings() {
+  setCompactOptionsOpen(false);
   if (!appSettings) {
     const res = await window.api.settingsGet();
     if (!res.ok) return addError(res.error || 'Could not load settings.');
@@ -1595,6 +2244,46 @@ const settingModelFields = {
   'setting-scout-model': 'scoutModel',
 };
 
+const settingModelPickers = Object.fromEntries(
+  Object.keys(settingModelFields).map((id) => [id, window.ModelPicker?.create($(id), {
+    emptyLabel: 'Automatic / last used',
+    disableWhenEmpty: false,
+  })])
+);
+
+// The cloud-only fields are hidden on a local provider rather than shown as
+// dead inputs, and the key's status is read separately because the key itself
+// never comes back to the renderer.
+async function syncProviderFields({ useDefaultEndpoint = false } = {}) {
+  const provider = $('setting-provider');
+  const cloud = provider.value === 'openai';
+  const defaultEndpoint = provider.selectedOptions[0]?.dataset.defaultEndpoint || '';
+  $('setting-endpoint').placeholder = defaultEndpoint;
+  if (useDefaultEndpoint && defaultEndpoint) $('setting-endpoint').value = defaultEndpoint;
+  $('settings-cloud-fields').classList.toggle('hidden', !cloud);
+  // The consequence belongs here, next to the choice, rather than inside the
+  // dropdown option where it cannot be read once the menu closes.
+  $('setting-provider-help').textContent = cloud
+    ? 'Every message is sent to this endpoint, including the contents of files the agent reads.'
+    : 'Inference runs on this machine. Nothing is sent anywhere.';
+  if (!cloud) return;
+  const state = await window.api.providerState();
+  const status = $('settings-key-status');
+  if (!state?.ok) { status.textContent = ''; return; }
+  status.textContent = state.key.set
+    ? `Key set (${state.key.hint})${state.key.encrypted ? '' : ' — stored as plain text: this system has no encrypted storage'}`
+    : 'No key set yet.';
+}
+
+async function syncJevFields() {
+  const state = await window.api.jevState();
+  const status = $('settings-jev-key-status');
+  if (!state?.ok) { status.textContent = ''; return; }
+  status.textContent = state.key.set
+    ? `Key set (${state.key.hint})${state.key.encrypted ? '' : ' — stored as plain text: this system has no encrypted storage'}`
+    : 'No Jev key set. Jev modes use native compaction.';
+}
+
 function populateSettingsModelSelects(source = appSettings || {}) {
   for (const [id, key] of Object.entries(settingModelFields)) {
     const select = $(id);
@@ -1614,6 +2303,7 @@ function populateSettingsModelSelects(source = appSettings || {}) {
       select.appendChild(option);
     }
     select.value = selected;
+    settingModelPickers[id]?.refresh(currentModelDetails);
   }
 }
 
@@ -1632,6 +2322,8 @@ function setTemperatureSelect(id, value) {
 function fillSettingsForm(settings) {
   populateSettingsModelSelects(settings);
   $('setting-endpoint').value = settings.inferenceEndpoint;
+  $('setting-provider').value = settings.provider === 'openai' ? 'openai' : 'ollama';
+  syncProviderFields();
   const standardContexts = ['0', '8192', '16384', '32768', '65536', '131072'];
   const contextValue = String(settings.mainContextCap);
   $('setting-main-context').value = standardContexts.includes(contextValue) ? contextValue : 'custom';
@@ -1639,6 +2331,10 @@ function fillSettingsForm(settings) {
   $('setting-main-context-custom').classList.toggle('hidden', $('setting-main-context').value !== 'custom');
   $('setting-auto-compact').checked = !!settings.autoCompact;
   $('setting-compact-threshold').value = Math.round(settings.compactThreshold * 100);
+  $('setting-compaction-engine').value = settings.compactionEngine || 'auto';
+  $('setting-jev-endpoint').value = settings.jevEndpoint || 'https://api.typesafe.ai/v1/systemone';
+  $('setting-jev-model').value = settings.jevModel || 'jev-latest';
+  syncJevFields();
   $('setting-keep-alive').value = settings.keepAlive;
   setTemperatureSelect('setting-code-temperature', settings.codeTemperature);
   setTemperatureSelect('setting-chat-temperature', settings.chatTemperature);
@@ -1646,10 +2342,10 @@ function fillSettingsForm(settings) {
   $('setting-code-think').checked = !!settings.codeThink;
   $('setting-chat-think').checked = !!settings.chatThink;
   $('setting-sidebar-open').checked = !!settings.sidebarOpen;
-  $('setting-auto-approve').checked = !!settings.autoApprove;
   $('setting-auto-branch').checked = !!settings.autoBranch;
   $('setting-review-mode').checked = !!settings.reviewMode;
   $('setting-mcp-auto-approve').checked = !!settings.mcpAutoApprove;
+  $('setting-online-auto-approve').checked = !!settings.onlineAutoApprove;
   $('setting-max-agent-steps').value = settings.maxAgentSteps;
   $('setting-loop-iterations').value = settings.defaultLoopIterations;
   $('setting-coder-context').value = settings.coderContextCap;
@@ -1663,9 +2359,13 @@ function settingsFromForm() {
   return {
     ...appSettings,
     inferenceEndpoint: $('setting-endpoint').value.trim(),
+    provider: $('setting-provider').value === 'openai' ? 'openai' : 'ollama',
     mainContextCap: Number(selectedContext === 'custom' ? $('setting-main-context-custom').value : selectedContext),
     autoCompact: $('setting-auto-compact').checked,
     compactThreshold: Number($('setting-compact-threshold').value) / 100,
+    compactionEngine: $('setting-compaction-engine').value,
+    jevEndpoint: $('setting-jev-endpoint').value.trim(),
+    jevModel: $('setting-jev-model').value.trim(),
     keepAlive: $('setting-keep-alive').value,
     chatModel: $('setting-chat-model').value,
     codeModel: $('setting-code-model').value,
@@ -1677,10 +2377,10 @@ function settingsFromForm() {
     codeThink: $('setting-code-think').checked,
     chatThink: $('setting-chat-think').checked,
     sidebarOpen: $('setting-sidebar-open').checked,
-    autoApprove: $('setting-auto-approve').checked,
     autoBranch: $('setting-auto-branch').checked,
     reviewMode: $('setting-review-mode').checked,
     mcpAutoApprove: $('setting-mcp-auto-approve').checked,
+    onlineAutoApprove: $('setting-online-auto-approve').checked,
     maxAgentSteps: Number($('setting-max-agent-steps').value),
     defaultLoopIterations: Number($('setting-loop-iterations').value),
     coderContextCap: Number($('setting-coder-context').value),
@@ -1702,7 +2402,7 @@ $('settings-test-endpoint').addEventListener('click', async () => {
   const status = $('settings-test-result');
   status.className = 'setting-status';
   status.textContent = 'Testing…';
-  const res = await window.api.settingsTestEndpoint($('setting-endpoint').value);
+  const res = await window.api.settingsTestEndpoint($('setting-endpoint').value, $('setting-provider').value);
   status.classList.add(res.ok ? 'ok' : 'error');
   status.textContent = res.ok ? `Connected — ${res.modelCount} model${res.modelCount === 1 ? '' : 's'} found.` : res.error;
 });
@@ -1723,6 +2423,7 @@ $('settings-form').addEventListener('submit', async (event) => {
   status.textContent = 'Saving…';
   const next = settingsFromForm();
   const oldEndpoint = appSettings.inferenceEndpoint;
+  const oldProvider = appSettings.provider;
   const res = await window.api.settingsSave(next);
   if (!res.ok) {
     status.classList.add('error');
@@ -1732,7 +2433,9 @@ $('settings-form').addEventListener('submit', async (event) => {
   appSettings = res.settings;
   coderModel = appSettings.coderModel || coderModel;
   subModel = appSettings.scoutModel || subModel;
-  if (oldEndpoint !== appSettings.inferenceEndpoint) await reloadModels(defaultModelForMode(appMode));
+  if (oldEndpoint !== appSettings.inferenceEndpoint || oldProvider !== appSettings.provider) {
+    await reloadModels(defaultModelForMode(appMode));
+  }
   applySessionDefaults();
   hideSettings();
   addInfo('Settings saved. New inference and agent requests will use them.');
@@ -1759,10 +2462,11 @@ const SLASH_HELP = [
   '/review [base] — run a structured read-only review and send selected findings to the coder',
   '/orchestrate <goal> — planner inspects and delegates sequential implementation tasks to the selected coder model',
   '/mission [iterations] <goal> — run a persisted coding mission; use status, stop, or resume',
-  '/model <name> — switch model (partial match ok)',
+  '/model [name] — show or switch model (partial match ok)',
   '/coder [name] — show or set the writable coding-worker model (partial match ok)',
   '/subagent [name] — show or set the subagent/verifier model (partial match ok)',
   '/usage — show how context and tokens have been spent across all agents',
+  '/cost — what this conversation has cost so far',
   '/mcp [on|off <server>] — external MCP tool servers: status, enable, disable',
   '/context — show exactly what will be sent to the model next turn (system prompt, per-message tokens, eviction flags)',
   '/pin [list|message <n>|file <path>] — keep important messages or project files in context',
@@ -1771,7 +2475,16 @@ const SLASH_HELP = [
   '/include <n> — restore an excluded tool result to inference',
   '/recs — compare installed models for this computer',
   '/auto <request> — select the best compatible installed model and run the request',
-  '/memory — view what the agent has remembered',
+  '/agent [--policy <name>] <goal> — run unattended: always branched, always checkpointed, always reported',
+  '/agent trigger [list|new|run <id>|enable <id>|disable <id>] — scheduled unattended runs; enable/disable are for project (.brittain) triggers',
+  '/agent daemon [status|start|stop|install|uninstall] — the headless runtime that keeps triggers firing with the app closed',
+  '/pending [approve|deny [<run>] [n|all]|resume [<run>]] — parked calls from suspended unattended runs; the run id is optional when only one is waiting',
+  '/policies [edit|promote <policy> <tool>] — autonomy policies, held calls, and evidence-backed promotion suggestions',
+  '/provider — which endpoint runs inference, whether a key is set, and what a run costs',
+  '/discord [edit] — bridge a Discord bot to the agent so it is reachable from a phone',
+  '/workspace [init] — the project\'s .brittain folder: in-repo memory, heartbeat checklist, project triggers',
+  '/memory [move] — view what the agent has remembered; move relocates it into the project (.brittain/MEMORY.md)',
+  '/ledger — view what this session changed, ran, and failed at (kept across compaction)',
   '/export — save this chat as a markdown file',
   '/tools — list all available tools',
 ].join('\n');
@@ -1780,8 +2493,9 @@ const CHAT_SLASH_HELP = [
   '/help — show this list',
   '/clear — start a new session',
   '/compact — summarize the conversation to free up context',
-  '/model <name> — switch model (partial match ok)',
+  '/model [name] — show or switch model (partial match ok)',
   '/usage — show context and token usage',
+  '/cost — what this conversation has cost so far',
   '/mcp [on|off <server>] - external MCP tool servers: status, enable, disable',
   '/context — show exactly what will be sent to the model next turn (system prompt, per-message tokens, eviction flags)',
   '/pin [list|message <n>] — keep important messages in context',
@@ -1790,22 +2504,66 @@ const CHAT_SLASH_HELP = [
   '/include <n> — restore an excluded tool result to inference',
   '/recs — compare installed models for this computer',
   '/auto <request> — select the best compatible installed model and run the request',
+  '/memory — view user-wide lessons remembered in folder-free Chat mode',
   '/export — save this chat as a markdown file',
   '/tools — list tools available to the app',
 ].join('\n');
+
+const MODEL_COMMAND_LIMIT = 20;
+
+function normalizeModelQuery(value) {
+  return String(value || '').toLowerCase().replace(/[._-]+/g, '').replace(/\s+/g, '');
+}
+
+function matchingModels(models, query) {
+  const needle = normalizeModelQuery(query);
+  if (!needle) return [...models];
+  return models.filter((model) => normalizeModelQuery(model).includes(needle));
+}
+
+function describeModelChoices(label, current, models, query = '') {
+  const matches = matchingModels(models, query);
+  const visible = matches.slice(0, MODEL_COMMAND_LIMIT);
+  const remaining = matches.length - visible.length;
+  const scope = query ? ` matching "${query}"` : '';
+  const lines = [`${label} model: ${current || '(not set)'}`, `Available models${scope}: ${visible.join(', ') || '(none)'}`];
+  if (remaining > 0) lines.push(`+${remaining} more. Add more of the model name to narrow the list.`);
+  else if (!query && models.length > MODEL_COMMAND_LIMIT) lines.push('Add part of a model name to narrow the list.');
+  return lines.join('\n');
+}
+
+function modelNotFound(query) {
+  return appSettings.provider === 'openai'
+    ? `No provider model matches "${query}". Check the provider catalog or use a broader name.`
+    : `No installed model matches "${query}". Run /recs after you install a model.`;
+}
+
+function selectModelMatch(models, query) {
+  const matches = matchingModels(models, query);
+  const normalized = normalizeModelQuery(query);
+  const exact = matches.find((model) => normalizeModelQuery(model) === normalized);
+  return { matches, selected: exact || (matches.length === 1 ? matches[0] : '') };
+}
 
 async function handleSlash(raw) {
   const [cmd, ...rest] = raw.slice(1).split(' ');
   const arg = rest.join(' ').trim();
   const normalizedCmd = cmd.toLowerCase();
-  const codeOnlyCommands = new Set(['diff', 'graph', 'loop', 'plan', 'review', 'orchestrate', 'mission', 'commit', 'coder', 'subagent', 'memory']);
+  const codeOnlyCommands = new Set(['diff', 'graph', 'loop', 'plan', 'review', 'orchestrate', 'mission', 'commit', 'coder', 'subagent', 'ledger', 'agent']);
   if (appMode === 'chat' && codeOnlyCommands.has(normalizedCmd)) {
     return addError(`/${normalizedCmd} is only available in Code mode.`);
   }
 
   switch (normalizedCmd) {
     case 'help':
-      return addInfo(appMode === 'chat' ? CHAT_SLASH_HELP : SLASH_HELP);
+      // /cost is meaningless without a bill, so it is not offered when
+      // inference is local — an advertised command that always answers "not
+      // applicable" is worse than one that is simply absent.
+      const billing = await window.api.costGet();
+      const listed = appMode === 'chat' ? CHAT_SLASH_HELP : SLASH_HELP;
+      return addInfo(billing?.cloud
+        ? listed
+        : listed.split('\n').filter((line) => !line.startsWith('/cost')).join('\n'));
 
     case 'clear':
       return newSession();
@@ -1827,7 +2585,9 @@ async function handleSlash(raw) {
       renderConversation(await window.api.getConversation());
       updateContextBar(res.approxTokens, res.contextLength);
       compactWarned = false; // re-arm the 80% warning for the fresh window
-      addInfo('Conversation compacted. The model will continue from the summary above.');
+      addInfo(res.degraded
+        ? `Compacted, but the model could not produce a usable summary — only the most recent turns were kept. ${res.description}`
+        : `Conversation compacted. ${res.description}`);
       return saveChat();
     }
 
@@ -1835,7 +2595,7 @@ async function handleSlash(raw) {
       return showDiff();
 
     case 'graph': {
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       const res = await window.api.gitGraph(cwd);
       if (!res.ok) return addError(res.error);
       return showOverlay('GIT GRAPH — ' + cwd, res.graph);
@@ -1844,13 +2604,13 @@ async function handleSlash(raw) {
     case 'loop': {
       if (busy) return;
       if (!modelSelect.value) return addError('No model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       let iterations = appSettings?.defaultLoopIterations || 8;
       let goal = arg;
       const m = goal.match(/^(\d+)\s+([\s\S]+)/);
       if (m) { iterations = parseInt(m[1], 10); goal = m[2].trim(); }
       if (!goal) return addError('Usage: /loop [iterations] <goal> — e.g. /loop 10 make all tests pass');
-      if (!autoApprove.checked) addInfo('Heads up: AUTO-APPROVE is off, so the loop will pause for every risky tool call. Turn it on for unattended runs.');
+      if (!runsUnattended()) addInfo('Heads up: autonomy is set to ' + (autonomyPolicies.find((entry) => entry.id === autonomyPolicy)?.label || autonomyPolicy) + ', so the loop will pause for approval. Pick a less supervised policy for unattended runs.');
 
       addMessage('user', `LOOP (max ${iterations}): ${goal}`);
       startRun();
@@ -1860,7 +2620,7 @@ async function handleSlash(raw) {
           subModel,
           goal,
           cwd,
-          autoApprove: autoApprove.checked,
+          autoApprove: runsUnattended(),
           autoBranch: autoBranchToggle.checked,
           onlineResearch: onlineResearchToggle.checked,
           think: thinkToggle.checked,
@@ -1879,7 +2639,7 @@ async function handleSlash(raw) {
     case 'plan': {
       if (busy) return;
       if (!modelSelect.value) return addError('No planner model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       if (!arg) return addError('Usage: /plan <goal>');
 
       const plannerModel = modelSelect.value;
@@ -1919,7 +2679,7 @@ async function handleSlash(raw) {
     case 'review': {
       if (busy) return;
       if (!modelSelect.value) return addError('No reviewer model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       const reviewCwd = cwd;
       startRun();
       let result;
@@ -1942,7 +2702,7 @@ async function handleSlash(raw) {
               coderModel,
               cwd: reviewCwd,
               findings: selected.map((finding) => ({ ...finding, suggested_fix: finding.suggestedFix })),
-              autoApprove: autoApprove.checked,
+              autoApprove: runsUnattended(),
               autoBranch: autoBranchToggle.checked,
               think: thinkToggle.checked,
             });
@@ -1967,9 +2727,9 @@ async function handleSlash(raw) {
       if (busy) return;
       if (!modelSelect.value) return addError('No orchestrator model selected.');
       if (!coderModel) return addError('No coder model selected. Use /coder <name>.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       if (!arg) return addError('Usage: /orchestrate <goal>');
-      if (!autoApprove.checked) addInfo('AUTO-APPROVE is off. The coding worker will pause for file writes and commands; online requests always require separate approval.');
+      if (!runsUnattended()) addInfo('Autonomy is supervised, so the coding worker will pause for file writes and commands; online requests always require separate approval.');
 
       addMessage('user', `ORCHESTRATE: ${arg}`);
       startRun();
@@ -1981,7 +2741,7 @@ async function handleSlash(raw) {
           subModel,
           goal: arg,
           cwd,
-          autoApprove: autoApprove.checked,
+          autoApprove: runsUnattended(),
           onlineResearch: onlineResearchToggle.checked,
           think: thinkToggle.checked,
         });
@@ -2017,7 +2777,7 @@ async function handleSlash(raw) {
           const res = await window.api.missionResume({
             cwd,
             chatId: currentChatId,
-            autoApprove: autoApprove.checked,
+            autoApprove: runsUnattended(),
             onlineResearch: onlineResearchToggle.checked,
             think: thinkToggle.checked,
           });
@@ -2033,13 +2793,13 @@ async function handleSlash(raw) {
       if (busy) return;
       if (!modelSelect.value) return addError('No model selected.');
       if (!coderModel) return addError('No coder model selected. Use /coder <name>.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       let iterations = appSettings?.defaultLoopIterations || 8;
       let goal = arg;
       const match = goal.match(/^(\d+)\s+([\s\S]+)/);
       if (match) { iterations = parseInt(match[1], 10); goal = match[2].trim(); }
       if (!goal) return addError('Usage: /mission [iterations] <goal> — e.g. /mission 12 add CSV export and verify it');
-      if (!autoApprove.checked) addInfo('Heads up: AUTO-APPROVE is off, so the mission will pause for every risky tool call. Turn it on for unattended runs.');
+      if (!runsUnattended()) addInfo('Heads up: autonomy is set to ' + (autonomyPolicies.find((entry) => entry.id === autonomyPolicy)?.label || autonomyPolicy) + ', so the mission will pause for approval. Pick a less supervised policy for unattended runs.');
 
       // A mission belongs to the chat that started it, not every chat in its
       // project. Allocate an ID now because a new chat is normally saved only
@@ -2054,7 +2814,7 @@ async function handleSlash(raw) {
           subModel,
           goal,
           cwd,
-          autoApprove: autoApprove.checked,
+          autoApprove: runsUnattended(),
           autoBranch: autoBranchToggle.checked,
           onlineResearch: onlineResearchToggle.checked,
           think: thinkToggle.checked,
@@ -2080,40 +2840,48 @@ async function handleSlash(raw) {
     }
 
     case 'model': {
-      if (!arg) return addError('Usage: /model <name>');
-      const match = [...modelSelect.options].map((o) => o.value).find((v) => v.includes(arg));
-      if (!match) return addError(`No installed model matching "${arg}".`);
-      modelSelect.value = match;
-      localStorage.setItem('model', match);
-      return addInfo('Model set to ' + match);
+      const models = [...modelSelect.options].map((o) => o.value);
+      if (!arg) return addInfo(describeModelChoices('Main', modelSelect.value, models));
+      const { matches, selected } = selectModelMatch(models, arg);
+      if (!matches.length) return addError(modelNotFound(arg));
+      if (!selected) return addInfo(describeModelChoices('Main', modelSelect.value, models, arg));
+      modelSelect.value = selected;
+      modelSelect.dispatchEvent(new Event('change'));
+      return addInfo('Model set to ' + selected);
     }
 
     case 'subagent': {
       const models = [...modelSelect.options].map((o) => o.value);
-      if (!arg) return addInfo(`Subagent model: ${subModel}\nAvailable: ${models.join(', ')}\nUse /subagent <name> to change.`);
-      const match = models.find((v) => v.includes(arg));
-      if (!match) return addError(`No installed model matching "${arg}".`);
-      subModel = match;
-      localStorage.setItem('subModel', match);
-      return addInfo('Subagent model set to ' + match);
+      if (!arg) return addInfo(describeModelChoices('Subagent', subModel, models));
+      const { matches, selected } = selectModelMatch(models, arg);
+      if (!matches.length) return addError(modelNotFound(arg));
+      if (!selected) return addInfo(describeModelChoices('Subagent', subModel, models, arg));
+      subModel = selected;
+      localStorage.setItem('subModel', selected);
+      return addInfo('Subagent model set to ' + selected);
     }
 
     case 'coder': {
       const models = [...modelSelect.options].map((o) => o.value);
-      if (!arg) return addInfo(`Coder model: ${coderModel}\nAvailable: ${models.join(', ')}\nUse /coder <name> to change. Run /recs after installing a new Ollama model to refresh the list.`);
-      const match = models.find((v) => v.includes(arg));
-      if (!match) return addError(`No installed model matching "${arg}". If Ollama just finished installing it, run /recs to refresh the model list.`);
-      coderModel = match;
-      localStorage.setItem('coderModel', match);
-      return addInfo('Coder model set to ' + match);
+      if (!arg) return addInfo(describeModelChoices('Coder', coderModel, models));
+      const { matches, selected } = selectModelMatch(models, arg);
+      if (!matches.length) return addError(modelNotFound(arg));
+      if (!selected) return addInfo(describeModelChoices('Coder', coderModel, models, arg));
+      coderModel = selected;
+      localStorage.setItem('coderModel', selected);
+      return addInfo('Coder model set to ' + selected);
     }
 
     case 'mcp': {
       const st = await window.api.mcpStatus();
       if (!arg) {
         if (!st.servers.length) return addInfo('No MCP servers configured.\nAdd them to ' + st.configPath + ' (same format as Claude Desktop) and restart the app.');
-        const lines = st.servers.map((sv) =>
-          `${sv.enabled ? '●' : '○'} ${sv.name} — ${sv.status}, ${sv.tools} tool${sv.tools === 1 ? '' : 's'}${sv.error ? ' — ' + sv.error : ''}`);
+        const lines = st.servers.flatMap((sv) => {
+          const row = `${sv.enabled ? '●' : '○'} ${sv.name} — ${sv.status}, ${sv.tools} tool${sv.tools === 1 ? '' : 's'}${sv.error ? ' — ' + sv.error : ''}`;
+          // Where a server writes anything it saves. Worth showing: a screenshot
+          // the model took is only useful if you can find it.
+          return sv.workingDirectory ? [row, `    files: ${sv.workingDirectory}`] : [row];
+        });
         return addInfo('MCP servers (● enabled / ○ disabled):\n' + lines.join('\n') + '\nMCP calls require approval unless "Auto-approve all MCP tool calls" is enabled in Settings.\nConfig: ' + st.configPath);
       }
       const m = arg.match(/^(on|off)\s+(.+)$/);
@@ -2123,21 +2891,8 @@ async function handleSlash(raw) {
     }
 
     case 'context': {
-      const res = await window.api.contextInspect({ model: modelSelect.value, cwd, mode: appMode, onlineResearch: onlineResearchToggle.checked });
-      if (!res.ok) return addError(res.error);
-      const lines = [
-        `SYSTEM PROMPT — ${res.systemTokens.toLocaleString()} tok`,
-        '',
-        `${res.messageCount} message(s) in conversation:`,
-      ];
-      res.rows.forEach((r, i) => {
-        const label = r.toolName ? `${r.role} [${r.toolName}]` : r.role;
-        const flagStr = r.flags.length ? `  ⚠ ${r.flags.join(', ')}` : '';
-        lines.push(`${String(i + 1).padStart(3)}. ${label.padEnd(18)} ~${String(r.tokens).padStart(6)} tok  "${r.preview}"${flagStr}`);
-      });
-      if (res.pinnedFiles.length) lines.push('', 'PINNED FILES:', ...res.pinnedFiles.map((file) => `  ${file}`));
-      lines.push('', `TOTAL: ~${res.totalTokens.toLocaleString()} / ${res.contextLength.toLocaleString()} tok (${res.percentUsed}% of window)`);
-      return showOverlay('CONTEXT — what will actually be sent', lines.join('\n'));
+      await showContextInspector();
+      return;
     }
 
     case 'pin':
@@ -2150,7 +2905,7 @@ async function handleSlash(raw) {
           .map((message, index) => message.pinned ? `${index + 1} (${message.role})` : '')
           .filter(Boolean);
         const excludedTools = conversation
-          .map((message, index) => message.excludedFromInference ? `${index + 1} (${message.tool_name || 'tool'})` : '')
+          .map((message, index) => message.excludedFromInference ? `${index + 1} (${(window.ToolNames ? window.ToolNames.displayToolName(message.tool_name) : message.tool_name) || 'tool'})` : '')
           .filter(Boolean);
         return addInfo([
           `Pinned messages: ${pinnedMessages.join(', ') || '(none)'}`,
@@ -2214,7 +2969,7 @@ async function handleSlash(raw) {
     case 'auto': {
       if (busy) return;
       if (!arg) return addError('Usage: /auto <request>');
-      if (appMode === 'code' && !cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (appMode === 'code' && !cwd) return addError('Choose a project folder below the model selector first.');
       setState('selecting model…');
       let route;
       try {
@@ -2230,8 +2985,7 @@ async function handleSlash(raw) {
       if (!route.ok) return addError('AUTO could not select a model: ' + route.error);
       if (!currentModels.includes(route.model)) return addError(`AUTO selected "${route.model}", but it is not in the current installed-model list.`);
       modelSelect.value = route.model;
-      localStorage.setItem('model', route.model);
-      localStorage.setItem(`model:${appMode}`, route.model);
+      modelSelect.dispatchEvent(new Event('change'));
       addInfo(`AUTO selected ${route.model} — ${route.reason}.${route.warning ? `\nWarning: ${route.warning}` : ''}`);
       input.value = arg;
       return send();
@@ -2265,15 +3019,408 @@ async function handleSlash(raw) {
       ].join('\n'));
     }
 
+    case 'cost': {
+      const res = await window.api.costGet();
+      if (!res?.ok) return addError('Could not read this conversation\'s cost.');
+      if (!res.cloud) {
+        return addInfo('Inference is running locally, so there is nothing to bill. Cost tracking applies to cloud providers.');
+      }
+      return addInfo(res.text);
+    }
+
+    case 'provider': {
+      const state = await window.api.providerState();
+      if (!state.ok) return addError('Could not read the provider settings.');
+
+      const cloud = state.provider === 'openai';
+      const lines = ['INFERENCE PROVIDER', ''];
+      lines.push(`Provider: ${cloud ? 'openai-compatible (cloud)' : 'ollama (local)'}`);
+      lines.push(`Endpoint: ${state.endpoint}`);
+      if (cloud) {
+        lines.push(`API key:  ${state.key.set ? `set (${state.key.hint})${state.key.encrypted ? ', encrypted' : ', PLAIN TEXT'}` : 'NOT SET — runs will be rejected'}`);
+        if (state.rates.inputPerMillion || state.rates.outputPerMillion) {
+          lines.push(`Rates:    $${state.rates.inputPerMillion}/M in, $${state.rates.outputPerMillion}/M out`);
+        } else {
+          lines.push('Rates:    not set — set them in Settings to see what a run costs');
+        }
+      }
+      lines.push('',
+        cloud
+          ? 'EVERY message in this mode leaves your machine and is sent to that endpoint.'
+          : 'Nothing leaves your machine: inference runs locally.',
+        cloud
+          ? 'That includes file contents the agent reads, which — with policy roots or MCP servers'
+          : 'Online research is still a separate, opt-in switch.',
+        cloud ? 'configured — can reach well beyond the project folder.' : '');
+      lines.push('', 'Change any of this in Settings. The key is stored there too, and is never shown in full again.');
+      return showOverlay('INFERENCE PROVIDER', lines.filter((line) => line !== undefined).join('\n'));
+    }
+
+    case 'discord': {
+      const state = await window.api.discordState();
+      if (!state.ok) return addError('Could not read the Discord bridge state.');
+      if (arg === 'edit' || arg === 'setup') {
+        const opened = await window.api.discordOpenConfig();
+        return addInfo(`Edit ${opened.path}, then restart Brittain Code to connect. The bridge runs inside the app — no separate process to start.`);
+      }
+      const lines = ['DISCORD BRIDGE', ''];
+      lines.push(`Config:  ${state.configPath}`);
+      if (state.error) lines.push(`         (could not be read: ${state.error})`);
+      // "The bridge is running" and "Discord accepted us" are different facts,
+      // and reporting them as one turned a rejected connection into a
+      // confident-looking "connected".
+      const gateway = state.identity?.state;
+      const status = !state.enabled ? 'disabled in discord.json'
+        : !state.running ? (state.daemonOwns
+          ? 'the daemon owns the connection — check its log, not this window'
+          : 'enabled, but nothing is running it yet (restart Brittain Code)')
+        : gateway === 'ready' ? 'connected'
+        : gateway === 'failed' ? 'REFUSED by Discord'
+        : gateway === 'closed' ? 'disconnected, retrying'
+        : 'connecting…';
+      lines.push(`Status:  ${status}`);
+      if (state.identity?.lastError) lines.push(`         ${state.identity.lastError}`);
+      if (state.missing?.length) lines.push(`Missing: ${state.missing.join(', ')}`);
+      if (state.cwd) lines.push(`Runs in: ${state.cwd} under "${state.policy}"`);
+      if (state.notifyChannel) lines.push(`Notifies: channel ${state.notifyChannel}`);
+      if (state.identity?.username) lines.push(`Bot:      ${state.identity.username}, in ${state.identity.guilds} server(s)`);
+      // Being in no server is the usual reason a bot cannot be reached at all:
+      // Discord refuses to open a DM between two accounts with nothing in common.
+      if (state.identity && state.identity.guilds === 0) {
+        lines.push('',
+          '⚠ This bot is in no servers, so Discord will not let you DM it.',
+          '  Invite it: Developer Portal → your app → OAuth2 → URL Generator →',
+          '  scopes: bot, permissions: Send Messages + Read Message History.',
+          '  Open the generated URL and add it to any server you are in.');
+      }
+      // No READY means Discord never accepted the connection. The reason is on
+      // the close frame, which the bridge now reports rather than looping on.
+      if (state.running && state.identity && state.identity.guilds === null && gateway !== 'failed') {
+        lines.push('', 'Discord has not accepted the connection yet. If this does not clear in a few',
+          'seconds, the usual causes are the Message Content intent being off, or a stale token.');
+      }
+      lines.push('',
+        'Message the bot a goal and it runs unattended; a parked call comes back to you',
+        'as a message you can approve from anywhere. !help lists the commands.',
+        '',
+        'The bridge runs inside the app or the daemon — whichever owns the trigger',
+        'scheduler — so there is no separate process to keep alive.',
+        '',
+        '/discord edit opens the config. Changes take effect on restart.');
+      return showOverlay('DISCORD BRIDGE', lines.join('\n'));
+    }
+
+    case 'workspace': {
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
+      if (arg === 'init') {
+        const res = await window.api.workspaceInit(cwd);
+        if (!res.ok) return addError(res.error);
+        const lines = [
+          res.alreadyPresent
+            ? `${res.dir} already exists.`
+            : `Created ${res.dir}${res.created.length ? ` (${res.created.join(', ')})` : ''}.`,
+        ];
+        if (res.moved) lines.push(`Carried ${res.moved} remembered line(s) in from app data; the old copy is left as a backup.`);
+        lines.push(
+          'Project memory now lives in the repository, so it shows up in diffs — review it like any other change.',
+          `A heartbeat trigger ships with it, inert: write a checklist item in ${res.heartbeatPath}, then turn it on with /agent trigger enable heartbeat.`,
+        );
+        return addInfo(lines.join(' '));
+      }
+      const state = await window.api.workspaceState(cwd);
+      if (!state.ok) return addError(state.error);
+      if (!state.exists) {
+        return showOverlay('PROJECT WORKSPACE', [
+          `No workspace in this project (${state.dir} does not exist).`,
+          '',
+          'Memory for this project is kept in app data instead:',
+          `  ${state.memoryPath}`,
+          '',
+          '/workspace init creates .brittain/ and moves memory into the repository, where it',
+          'shows up in diffs and travels with a clone. It also adds HEARTBEAT.md, the checklist',
+          'a heartbeat run evaluates. Nothing creates this folder automatically — putting agent',
+          'memory under version control is your call.',
+        ].join('\n'));
+      }
+      return showOverlay('PROJECT WORKSPACE — ' + state.dir, [
+        `Memory:    ${state.memoryPath}`,
+        `Heartbeat: ${state.heartbeatPath} (${state.heartbeatItems} checklist item(s))`,
+        '',
+        'MEMORY.md, HEARTBEAT.md, triggers.json and autonomy.json are meant to be committed.',
+        'state.json and runs/ are gitignored.',
+        '',
+        'In-repo config can only narrow autonomy, never widen it, and project triggers arrive',
+        'disabled — these files can reach you through a pull request.',
+      ].join('\n'));
+    }
+
     case 'memory': {
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
-      const res = await window.api.memoryGet(cwd);
+      const memoryCwd = appMode === 'chat' ? null : cwd;
+      if (appMode !== 'chat' && !memoryCwd) return addError('Choose a project folder below the model selector first.');
+      if (arg === 'move') {
+        if (!memoryCwd) return addError('Folder-free Chat memory is user-wide and cannot move into a project.');
+        const moved = await window.api.memoryMove(memoryCwd);
+        if (!moved.ok) return addError(moved.error);
+        return addInfo(`Project memory now lives in ${moved.path} (${moved.moved} line(s) copied in`
+          + (moved.created.length ? `; created ${moved.created.join(', ')}` : '') + '). '
+          + 'The app-data copy remains as a backup. .brittain/MEMORY.md is meant to be committed — review it like any other change.');
+      }
+      const res = await window.api.memoryGet(memoryCwd);
       if (!res.ok) return addError(res.error);
-      let content = res.content.trim() || '(nothing remembered for this project yet)';
+      let content = res.content.trim() || (res.globalChat
+        ? '(nothing remembered for folder-free Chat mode yet)'
+        : '(nothing remembered for this project yet)');
+      if (res.inRepo) content = '(in-repo: .brittain/MEMORY.md)\n\n' + content;
       if (res.legacyContent?.trim()) {
         content += `\n\nLEGACY UNIVERSAL MEMORY (not injected)\n${res.legacyPath}\n\n${res.legacyContent.trim()}`;
       }
-      return showOverlay('PROJECT MEMORY — ' + res.path, content);
+      return showOverlay((res.globalChat ? 'CHAT MEMORY — ' : 'PROJECT MEMORY — ') + res.path, content);
+    }
+
+    case 'agent': {
+      if (busy) return;
+      if (!modelSelect.value) return addError('No model selected.');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
+
+      // Triggers are authored in a file, the way mcp.json already is: entering
+      // agent mode there is a setup act, not a session act.
+      if (/^daemon\b/.test(arg)) {
+        const [, sub = 'status'] = arg.split(/\s+/);
+        if (sub === 'install') {
+          const res = await window.api.daemonInstall();
+          return res.ok
+            ? addInfo(`Daemon installed: ${res.plistPath}. It runs headless at login and owns the trigger scheduler; this window stops ticking triggers once it is alive.`)
+            : addError(res.error);
+        }
+        if (sub === 'uninstall') {
+          const res = await window.api.daemonUninstall();
+          return res.ok ? addInfo('Daemon stopped and uninstalled. It will not return at login.') : addError(res.error);
+        }
+        if (sub === 'start' || sub === 'restart') {
+          const res = await window.api.daemonStart();
+          return res.ok
+            ? addInfo('Daemon is running and answering. It owns the trigger scheduler and the Discord bridge from here on.')
+            : addError(res.error);
+        }
+        if (sub === 'stop') {
+          const res = await window.api.daemonStop();
+          if (!res.ok) return addError(res.error);
+          return addInfo(res.wasLoaded
+            ? 'Daemon stopped. Triggers and the Discord bridge move back to this window; /agent daemon start brings it back.'
+            : 'Daemon was not running. Nothing to stop.');
+        }
+        const res = await window.api.daemonStatus();
+        return showOverlay('AGENT DAEMON', [
+          `Alive: ${res.alive ? 'yes' : 'no'}`,
+          `Socket: ${res.socketPath}`,
+          res.launchAgent ? `LaunchAgent: ${res.launchAgent} (${res.installed ? 'installed' : 'not installed'})` : 'LaunchAgent: macOS only',
+          '',
+          'The daemon is the headless runtime: triggers and heartbeats keep firing with every window closed.',
+          '/agent daemon install to set it up (opt-in; runs at login).',
+          '/agent daemon start · stop — control it without reinstalling.',
+        ].join('\n'));
+      }
+
+      if (/^trigger\b/.test(arg)) {
+        const [, sub = 'list', id = ''] = arg.split(/\s+/);
+        if (sub === 'new' || sub === 'edit') {
+          const opened = await window.api.triggersOpenConfig();
+          return addInfo(`Edit triggers in ${opened.path}, then reload with /agent trigger list.`);
+        }
+        if (sub === 'run') {
+          if (!id) return addError('Usage: /agent trigger run <id>');
+          startRun();
+          let res;
+          try { res = await window.api.triggersRun(id); } finally { endRun(); }
+          return res.ok ? saveChat() : addError(res.error);
+        }
+        if (sub === 'enable' || sub === 'disable') {
+          if (!id) return addError(`Usage: /agent trigger ${sub} <id> — acts on this project's .brittain/triggers.json entries.`);
+          const res = sub === 'enable'
+            ? await window.api.triggersEnableProject(cwd, id)
+            : await window.api.triggersDisableProject(cwd, id);
+          return res.ok
+            ? addInfo(sub === 'enable'
+              ? `Project trigger "${id}" enabled. It re-disables automatically if its definition changes (e.g. via git pull).`
+              : `Project trigger "${id}" disabled.`)
+            : addError(res.error);
+        }
+        const state = await window.api.triggersState(cwd);
+        const lines = [`TRIGGERS — ${state.configPath}`];
+        if (state.error) lines.push(`(could not be read: ${state.error})`);
+        if (!state.triggers.length) lines.push('(none configured — /agent trigger new to create the file)');
+        for (const trigger of state.triggers) {
+          lines.push(`${trigger.enabled ? '[on] ' : '[off]'} ${trigger.id} — ${trigger.type === 'heartbeat' ? 'heartbeat (paced by .brittain/HEARTBEAT.md)' : trigger.schedule + ' — ' + trigger.goal}`
+            + (trigger.problem ? `  ⚠ ${trigger.problem}` : ''));
+        }
+        if (state.project?.length || state.projectError) {
+          lines.push('', `PROJECT TRIGGERS (.brittain/triggers.json) — disabled on arrival; /agent trigger enable <id>:`);
+          if (state.projectError) lines.push(`(could not be read: ${state.projectError})`);
+          for (const trigger of state.project || []) {
+            const mark = trigger.enablement === 'enabled' ? '[on] ' : trigger.enablement === 'changed' ? '[chg]' : '[off]';
+            lines.push(`${mark} ${trigger.id} — ${trigger.type === 'heartbeat' ? 'heartbeat' : trigger.schedule + ' — ' + trigger.goal}`
+              + (trigger.enablement === 'changed' ? '  ⚠ definition changed since enablement — re-enable to let it fire' : '')
+              + (trigger.problem ? `  ⚠ ${trigger.problem}` : ''));
+          }
+        }
+        if (state.queued.length) {
+          lines.push('', 'WAITING TO RUN:');
+          for (const entry of state.queued) lines.push(`- ${entry.goal} (queued ${entry.enqueuedAt})`);
+        }
+        lines.push('', 'Triggers only fire while Brittain Code is open.');
+        return showOverlay('AGENT TRIGGERS', lines.join('\n'));
+      }
+
+      let goal = arg;
+      let policy = '';
+      const flagged = goal.match(/^--policy\s+(\S+)\s+([\s\S]+)/);
+      if (flagged) { policy = flagged[1]; goal = flagged[2].trim(); }
+      if (!goal) return addError('Usage: /agent [--policy <name>] <goal> — runs unattended, always on a branch, always reported.');
+
+      // Disclosure before an unattended run, once per project. Undo is the wrong
+      // safety model for a run that can act on the world, so this states plainly
+      // what unattended means instead of implying a checkpoint will save you.
+      if (!(await confirmAgentRun(cwd, policy))) return;
+
+      const coder = coderModel || modelSelect.value;
+      addMessage('user', `AGENT: ${goal}`);
+      startRun();
+      let res;
+      try {
+        res = await window.api.agentRun({
+          model: modelSelect.value,
+          coderModel: coder,
+          subModel: subModel || 'qwen3:8b',
+          goal,
+          cwd,
+          policy,
+          think: thinkToggle.checked,
+          onlineResearch: onlineResearchToggle.checked,
+          maxIterations: appSettings?.defaultLoopIterations || 8,
+          chatId: currentChatId,
+        });
+      } catch (err) {
+        res = { ok: false, error: err.message || String(err) };
+      } finally {
+        endRun();
+      }
+      if (!res.ok) return addError(res.error);
+      return saveChat();
+    }
+
+    case 'pending': {
+      const [sub = '', runArg = '', callArg = ''] = arg.split(/\s+/);
+
+      // Approve/deny mark decisions on the stored record; resume is the
+      // separate, explicit act that executes them and continues the run.
+      if (sub === 'approve' || sub === 'deny' || sub === 'resume') {
+        const listed = await window.api.pendingList();
+        const target = PendingTarget.resolvePendingTarget(listed.records || [], runArg, callArg);
+        if (target.error) return addError(target.error);
+        const { record, selector } = target;
+
+        if (sub === 'resume') {
+          const undecided = record.parked.filter((entry) => !entry.decision).length;
+          if (undecided) addInfo(`${undecided} parked call(s) are undecided — resuming treats them as denied.`);
+          startRun();
+          let res;
+          try { res = await window.api.pendingResume(record.runId); } finally { endRun(); }
+          return res.ok ? saveChat() : addError(res.error);
+        }
+
+        const approved = sub === 'approve';
+        const indexes = selector && selector !== 'all'
+          ? [parseInt(selector, 10)].filter((n) => Number.isInteger(n))
+          : record.parked.map((entry) => entry.index);
+        if (!indexes.length) return addError(`"${selector}" is not one of this run's parked calls. /pending lists them by index.`);
+        for (const index of indexes) {
+          const res = await window.api.pendingResolve(record.runId, index, approved);
+          if (!res.ok) return addError(res.error);
+        }
+        return addInfo(`${approved ? 'Approved' : 'Denied'} ${indexes.length} parked call(s) on ${record.runId}.`
+          + ` /pending resume${listed.records.length > 1 ? ' ' + record.runId : ''} to continue the run.`);
+      }
+
+      const listed = await window.api.pendingList();
+      if (!listed.ok) return addError('Could not read suspended runs.');
+      const lines = [];
+      for (const record of listed.expired || []) lines.push(`(expired unanswered: "${record.goal}")`);
+      if (!listed.records.length) lines.push('No suspended runs. When an unattended run parks a call, it appears here.');
+      for (const record of listed.records) {
+        lines.push(`${record.runId} — "${record.goal}"`, `  suspended ${record.suspendedAt} in ${record.cwd}`);
+        for (const entry of record.parked) {
+          lines.push(`  [${entry.index}] ${entry.name}${entry.target ? ` on ${entry.target}` : ''} — ${entry.reason}${entry.decision ? ` (${entry.decision})` : ''}`);
+        }
+        lines.push('');
+      }
+      lines.push(listed.records.length === 1
+        ? '/pending approve [n|all] · /pending deny [n|all] · /pending resume — the run id is optional while only this one is waiting'
+        : '/pending approve <run> [n|all] · /pending deny <run> [n|all] · /pending resume <run>');
+      return showOverlay('PARKED CALLS', lines.join('\n'));
+    }
+
+    case 'policies': {
+      const state = await window.api.autonomyState();
+      if (!state?.ok) return addError('Could not read autonomy policies.');
+      if (arg === 'edit' || arg === 'new') {
+        const opened = await window.api.autonomyOpenConfig();
+        return addInfo(`Edit custom policies in ${opened.path}, then reload with /policies.`);
+      }
+      if (/^promote\b/.test(arg)) {
+        const [, policyId = '', toolName = ''] = arg.split(/\s+/);
+        if (!policyId || !toolName) return addError('Usage: /policies promote <custom-policy> <tool> — adds the tool to that policy\'s allow list.');
+        const res = await window.api.autonomyPromote(policyId, toolName);
+        if (!res.ok) return addError(res.error);
+        return addInfo(res.already
+          ? `${toolName} is already on ${policyId}'s allow list.`
+          : `Promoted ${toolName} into ${policyId}'s allow list (${res.configPath}).`);
+      }
+      const lines = ['AUTONOMY POLICIES', ''];
+      for (const policy of state.policies) {
+        lines.push(`${policy.id === state.current ? '▶ ' : '  '}${policy.id}${policy.builtIn ? '' : ' (custom)'} — ${policy.description || policy.label}`);
+        // Reaching outside the project is the one policy setting worth seeing
+        // without opening the config file.
+        if (policy.roots?.length) lines.push(`      reaches outside the project: ${policy.roots.join(', ')}`);
+        if (policy.rejectedRoots?.length) lines.push(`      ⚠ unusable roots ignored: ${policy.rejectedRoots.join(', ')}`);
+      }
+      if (state.configError) lines.push('', `autonomy.json: ${state.configError}`);
+      if (state.deferred.length) {
+        lines.push('', 'HELD FOR REVIEW (last unattended run):');
+        for (const entry of state.deferred) {
+          lines.push(`- ${entry.name}${entry.target ? ` on ${entry.target}` : ''} — ${entry.reason}`);
+        }
+      }
+      // The learning loop: patterns held often across runs and never denied by
+      // a human are evidence a policy is too tight. Promotion is always a
+      // person's click, never automatic.
+      const learned = await window.api.autonomySuggestions();
+      if (learned?.ok && learned.suggestions.length) {
+        lines.push('', 'SUGGESTIONS (held often across runs, never denied by you):');
+        for (const suggestion of learned.suggestions) {
+          lines.push(`- ${suggestion.key} — held ${suggestion.held}× across ${suggestion.runs} run(s)`
+            + (suggestion.example ? ` (e.g. ${suggestion.example})` : '')
+            + ` → /policies promote <custom-policy> ${suggestion.name}`);
+        }
+      }
+      lines.push('', 'Set with the AUTONOMY dial, or /policies edit to define a custom one.');
+      return showOverlay('AUTONOMY POLICIES', lines.join('\n'));
+    }
+
+    case 'ledger': {
+      const res = await window.api.ledgerGet();
+      if (!res.ok) return addError(res.error || 'Could not read the session ledger.');
+      const parts = [];
+      parts.push(res.live || '(no tool activity in the current conversation yet)');
+      if (res.snapshots.length) {
+        parts.push('', `EARLIER, SAVED AT COMPACTION (${res.path}):`);
+        for (const snapshot of res.snapshots) {
+          const when = snapshot.at ? new Date(snapshot.at).toLocaleString() : 'unknown time';
+          parts.push(`- ${when} — ${snapshot.before} → ${snapshot.after} tokens · `
+            + `${snapshot.changed} files changed · ${snapshot.commands} commands · ${snapshot.errors} errors`
+            + (snapshot.degraded ? ' · no usable summary' : ''));
+        }
+      }
+      return showOverlay('SESSION LEDGER — ' + res.sessionId, parts.join('\n'));
     }
 
     case 'export': {
@@ -2318,11 +3465,71 @@ $('commit-btn').addEventListener('click', () => {
   input.focus();
 });
 
+async function showContextInspector() {
+  const res = await window.api.contextInspect({
+    model: modelSelect.value,
+    cwd,
+    mode: appMode,
+    onlineResearch: onlineResearchToggle.checked,
+  });
+  if (!res.ok) return addError(res.error || 'Failed to inspect context.');
+
+  const handleControl = async (payload) => {
+    if (busy || hasChatRuns()) {
+      addError('Wait for active and queued runs to finish before changing context controls.');
+      return false;
+    }
+    const ctrlRes = await window.api.contextControl(payload);
+    if (!ctrlRes.ok) {
+      addError(ctrlRes.error);
+      return false;
+    }
+    const updated = await window.api.contextInspect({
+      model: modelSelect.value,
+      cwd,
+      mode: appMode,
+      onlineResearch: onlineResearchToggle.checked,
+    });
+    if (updated.ok && window.ContextViewer) {
+      window.ContextViewer.show(updated, { $, hideOverlay, onControl: handleControl });
+    }
+    return true;
+  };
+
+  if (window.ContextViewer) {
+    window.ContextViewer.show(res, { $, hideOverlay, onControl: handleControl });
+  } else {
+    const toolLabel = res.toolCount
+      ? `TOOL SCHEMAS  — ${res.toolTokens.toLocaleString()} tok (${res.toolCount} definitions${res.mcpToolCount ? `, ${res.mcpToolCount} from MCP` : ''})`
+      : 'TOOL SCHEMAS  — 0 tok (no tools sent in this mode)';
+    const lines = [
+      `SYSTEM PROMPT — ${res.systemTokens.toLocaleString()} tok`,
+      toolLabel,
+      '',
+      `${res.messageCount} message(s) in conversation:`,
+    ];
+    res.rows.forEach((r, i) => {
+      const label = r.toolName ? `${r.role} [${window.ToolNames ? window.ToolNames.displayToolName(r.toolName) : r.toolName}]` : r.role;
+      const flagStr = r.flags?.length ? `  ⚠ ${r.flags.join(', ')}` : '';
+      lines.push(`${String(i + 1).padStart(3)}. ${label.padEnd(18)} ~${String(r.tokens).padStart(6)} tok  "${r.preview}"${flagStr}`);
+    });
+    if (res.pinnedFiles?.length) lines.push('', 'PINNED FILES:', ...res.pinnedFiles.map((file) => `  ${file}`));
+    lines.push('', `TOTAL: ~${res.totalTokens.toLocaleString()} / ${res.contextLength.toLocaleString()} tok (${res.percentUsed}% of window)`);
+    showOverlay('CONTEXT — what will actually be sent', lines.join('\n'));
+  }
+}
+
+const ctxSummaryEl = $('ctx-summary');
+if (ctxSummaryEl) ctxSummaryEl.addEventListener('click', showContextInspector);
+const ctxBarWrapEl = $('ctx-bar-wrap');
+if (ctxBarWrapEl) ctxBarWrapEl.addEventListener('click', showContextInspector);
+
 // ---------- overlay ----------
 function showOverlay(title, text, opts = {}) {
   $('overlay-title').textContent = title;
   $('overlay-box').classList.remove('recommendations-overlay');
   $('overlay-box').classList.remove('diff-v2-overlay');
+  $('overlay-box').classList.remove('context-v2-overlay');
   const body = $('overlay-body');
   body.className = '';
   body.replaceChildren();
@@ -2393,6 +3600,13 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!$('settings-modal').classList.contains('hidden')) hideSettings();
     else if (!$('overlay').classList.contains('hidden')) hideOverlay();
-    else if (busy) window.api.stop();
+    else if (compactOptions.classList.contains('open')) {
+      setCompactOptionsOpen(false);
+      compactOptionsButton.focus();
+    }
+    else if (busy || currentChatRun()) {
+      const run = currentChatRun();
+      window.api.stop(run ? { chatId: currentChatId, runId: run.runId } : undefined);
+    }
   }
 });

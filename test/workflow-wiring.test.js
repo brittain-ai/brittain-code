@@ -57,8 +57,11 @@ test('missions wrap the bounded coder loop with persisted status and explicit st
   assert.match(preload, /missionStart: \(payload\) => ipcRenderer\.invoke\('mission:start'/);
   assert.match(preload, /missionStop: \(\) => ipcRenderer\.invoke\('mission:stop'/);
   assert.match(preload, /missionResume: \(payload\) => ipcRenderer\.invoke\('mission:resume'/);
-  assert.match(main, /ipcMain\.handle\('mission:start',[\s\S]*chatId/);
-  assert.match(main, /chatId,\n\s*startedAt/);
+  // Starting a mission is callable without IPC, so a trigger or a queue can do
+  // it; the handler is a wrapper that records who asked.
+  assert.match(main, /async function startMission\(\{[\s\S]*origin = 'ui',/);
+  assert.match(main, /ipcMain\.handle\('mission:start', async \(_e, payload = \{\}\) => startMission\(\{ \.\.\.payload, origin: 'ui' \}\)\)/);
+  assert.match(main, /chatId,\n\s*origin,\n\s*startedAt/);
   assert.match(main, /runCoderGoalLoop\(\{/);
   assert.match(main, /ipcMain\.handle\('mission:stop'/);
   assert.match(main, /ipcMain\.handle\('mission:resume'/);
@@ -102,6 +105,13 @@ test('Code and Chat modes are wired through UI, persistence, and the agent bound
   assert.match(historyStore, /mode: meta\.mode === 'chat' \? 'chat' : 'code'/);
   assert.match(main, /const runMode = mode === 'chat' \? 'chat' : 'code'/);
   assert.match(main, /const modeTools = chatMode \? CHAT_TOOLS : TOOL_DEFS/);
+  // MCP access must not be gated behind ONLINE, and the local calculator must
+  // remain available when both ONLINE and MCP are off.
+  assert.match(main, /const chatTools = \(onlineResearch \? modeTools : offline\(modeTools\)\)\.concat\(mcpDefs\);/);
+  // Chat mode returns its tools rather than null; abbreviating the payload is a
+  // separate decision that must not drop any of them.
+  assert.match(main, /return index\(chatTools\);/);
+  assert.match(main, /Use calculate for repeated values, tables, statistics, matrices, high precision, or verification/);
   assert.match(main, /if \(!activeToolNames\.has\(name\)\)/);
 });
 
@@ -158,8 +168,14 @@ test('general attachments are wired from the picker through local extraction and
   const packageJson = JSON.parse(source('package.json'));
 
   assert.match(html, /id="attach-btn"/);
+  assert.match(html, /id="attachment-drop-overlay"/);
+  assert.match(html, /features\/attachment-drop\.js/);
   assert.match(html, /application\/pdf/);
-  assert.match(renderer, /files,\n\s+\}\);/);
+  assert.match(renderer, /document\.addEventListener\('drop'/);
+  assert.match(renderer, /AttachmentDrop\.filesFromTransfer\(e\.dataTransfer\)/);
+  assert.match(renderer, /attachmentSlotsUsed\(\) >= MAX_ATTACHMENTS/);
+  assert.match(renderer, /if \(pendingAttachmentReads\) return addError/);
+  assert.match(renderer, /imageAttachments,\s*files,\s*history: \{/);
   assert.match(renderer, /msg\.attachments \|\| \[\]/);
   assert.match(main, /extractFileAttachments\(files/);
   assert.match(main, /contentWithAttachments\(text, fileAttachments\)/);
@@ -181,8 +197,12 @@ test('settings are wired through the modal, bridge, persistence, and inference r
   assert.match(renderer, /defaultLoopIterations \|\| 8/);
   assert.match(preload, /settingsTestEndpoint/);
   assert.match(main, /ipcMain\.handle\('settings:save'/);
-  assert.match(main, /fetch\(inferenceEndpoint\(\) \+ '\/api\/chat'/);
-  assert.match(main, /keep_alive: runtimeSettings\.keepAlive/);
+  // The endpoint reaches inference through a transport now: it is the transport
+  // that decides between Ollama's /api/chat and an OpenAI-compatible
+  // /chat/completions, so pinning one path here would pin the wrong thing.
+  assert.match(main, /const transport = transportFor\(runtimeSettings\.provider\);/);
+  assert.match(main, /endpoint: inferenceEndpoint\(\),/);
+  assert.match(main, /keepAlive: runtimeSettings\.keepAlive,/);
   assert.equal(packageJson.build.files.includes('settings.js'), true);
 });
 
@@ -262,4 +282,16 @@ test('structured review can send selected findings to the coder', () => {
   assert.match(main, /ipcMain\.handle\('chat:review'/);
   assert.match(main, /ipcMain\.handle\('chat:reviewFix'/);
   assert.match(main, /await createCheckpoint\(cwd\)/);
+});
+
+test('Context viewer is structured with 2-column layout and wired through renderer', () => {
+  const html = source('renderer/index.html');
+  const renderer = source('renderer/app.js');
+  const main = source('main.js');
+
+  assert.match(html, /features\/context-viewer\.js/);
+  assert.match(html, /styles\/context-viewer\.css/);
+  assert.match(renderer, /window\.ContextViewer\.show/);
+  assert.match(renderer, /showContextInspector/);
+  assert.match(main, /ipcMain\.handle\('context:inspect'/);
 });
