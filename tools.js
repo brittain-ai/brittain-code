@@ -292,7 +292,7 @@ function syntaxCheck(filePath) {
 }
 
 // ---------- degraded-model guards ----------
-// Long autonomous runs (see fablereview.md) showed models leaking their inner
+// Long autonomous runs (see docs/fablereview.md) showed models leaking their inner
 // monologue into code comments, truncating good files with shrinking rewrites,
 // and rewriting the same file in a futile loop. These heuristics put loud
 // warnings in the tool result — the one place a drifting model still reads.

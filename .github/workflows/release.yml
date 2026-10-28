@@ -26,7 +26,7 @@ jobs:
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
           test "${PACKAGE_VERSION#*-}" = "${PACKAGE_VERSION}"
-          test -s "RELEASE_NOTES-${PACKAGE_VERSION}.md"
+          test -s "docs/releases/${PACKAGE_VERSION}.md"
 
   mac:
     needs: test
@@ -85,4 +85,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Publish complete release
-        run: gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --notes-file "RELEASE_NOTES-${GITHUB_REF_NAME#v}.md" --draft=false --latest
+        run: gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --notes-file "docs/releases/${GITHUB_REF_NAME#v}.md" --draft=false --latest
