@@ -31,7 +31,7 @@ test('psychosis: byte-fallback / replacement token triggers content scan', () =>
 });
 
 test('psychosis: full-width punctuation adjacent to identifier triggers, prose does not', () => {
-  // real observed case (fablereview.md): a full-width period corrupting an
+  // real observed case (docs/fablereview.md): a full-width period corrupting an
   // identifier mid-name, e.g. getTitleFromContent -> getTitle．Content
   const hit = scanContentForPsychosis('const value = getTitle．Content(note);', { value: 0 });
   assert.ok(hit, 'expected the identifier-adjacent full-width period to trigger');
