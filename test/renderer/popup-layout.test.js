@@ -6,19 +6,20 @@ const path = require('node:path');
 const root = path.join(__dirname, '..', '..');
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 
-test('dialogs stay below the measured top bar', () => {
+// The top bar sits inside the workspace beside the sidebar, so dialogs dim the
+// whole window rather than starting below a full-width header.
+test('dialogs cover the whole window', () => {
   const css = read('renderer/style.css');
-  const app = read('renderer/app.js');
 
   for (const id of ['overlay', 'confirm-modal', 'settings-modal']) {
     assert.match(
       css,
-      new RegExp(`#${id} \\{[\\s\\S]*?inset: var\\(--topbar-height\\) 0 0;`),
-      `${id} must use the top-bar inset`
+      new RegExp(`#${id} \\{[\\s\\S]*?inset: 0;`),
+      `${id} must cover the window`
     );
   }
 
-  assert.match(app, /new ResizeObserver\(syncPopupArea\)\.observe\(topbar\);/);
+  assert.doesNotMatch(css, /--topbar-height/);
   assert.match(css, /#settings-form \{[\s\S]*?max-height: 100%;/);
   assert.match(css, /#overlay-box \{[\s\S]*?max-height: 100%;/);
 });

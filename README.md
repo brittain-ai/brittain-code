@@ -34,8 +34,12 @@ The built app is a snapshot of the code at build time — editing `main.js` or t
 
 1. Choose **CODE** for project work or **CHAT** for folder-free conversation and research.
 2. Pick a model from the dropdown. Models that support tool calling work best — **qwen3.6:27b** and **gemma4:26b** are the strongest for agent tasks, **qwen3:8b** and **gemma4:latest** are fast fallbacks. qwen3-coder:30b sometimes emits malformed tool calls; tiny models (qwen2.5-coder:1.5b) are chat-only.
-3. In Code mode, click **DIR** and choose the project folder the agent should work in. Chat mode deliberately has no directory or project tools.
+3. In Code mode, choose the project folder below the model selector. Chat mode has no project file access.
 4. Type a task or question and hit Enter.
+
+The interface follows the Brittain web chat layout. The sidebar contains **New chat**, **Models**, conversation search, and **Settings**. Search finds chat titles, project folders, and model names. The model selector stays at the top of the conversation. In Code mode, the row below it contains the folder, Git actions, and active approval policy.
+
+**Run options** beside the message field contains THINK, web research, the approval policy, automatic branching, and review mode. Web research still requires confirmation before it is enabled. Context use appears below the message field. **Run details** shows elapsed time, tool calls, speed, and app version.
 
 The agent can inspect and edit files, search source and locally installed documentation, run allowlisted project checks, inspect Git state, manage local development processes, verify loopback HTTP servers, and run shell commands. `run_project_check` discovers npm-compatible scripts, CMake configure/build/CTest flows, Cargo, Go, Python/pytest, and safe Make targets; every command runs without a shell. File tools are confined to the selected project directory. It asks before writes, commands, and other risky operations. The **AUTONOMY** dial sets how much a run may do without asking: *Supervised* prompts before every risky call, *Guarded* lets reads and project checks through but still asks before writes and commands, and *Trusted* runs ordinary risky tools unattended. Whatever the setting, destructive operations, sensitive reads, and external MCP tools always require explicit approval, and online requests need both the ONLINE switch and a policy that permits them. Custom policies can be defined in `autonomy.json` in the application-data directory; built-in ones cannot be overridden.
 
@@ -173,7 +177,7 @@ Coordinated edits can use an atomic multi-file batch: every exact match and synt
 
 The status bar shows: current state, context usage (tokens used vs the model's context window, with a fill bar), elapsed time for the current run, and total tool calls.
 
-**NEW SESSION** clears the conversation (context resets to zero).
+**New chat** clears the conversation (context resets to zero).
 
 ## Settings
 

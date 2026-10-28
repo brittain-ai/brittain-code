@@ -8,17 +8,7 @@ const stopBtn = $('stop-btn');
 const modelSelect = $('model-select');
 const autonomySelect = $('autonomy-select');
 
-// Keep dialogs in the usable area below the top bar. The bar can wrap when the
-// window is narrow, so its height is measured instead of copied into the CSS.
 const topbar = $('topbar');
-function syncPopupArea() {
-  document.documentElement.style.setProperty(
-    '--topbar-height',
-    `${Math.ceil(topbar.getBoundingClientRect().bottom)}px`
-  );
-}
-syncPopupArea();
-new ResizeObserver(syncPopupArea).observe(topbar);
 
 // Autonomy replaced the AUTO-APPROVE checkbox: one control for one concept,
 // because two overlapping supervision controls is how an unsupervised write
@@ -45,6 +35,7 @@ async function loadAutonomy() {
   autonomySelect.value = autonomyPolicy;
   document.body.dataset.autonomy = runsUnattended() ? 'unattended' : 'attended';
   $('autonomy-control').title = autonomyDescription(autonomyPolicy) || 'How much this run may do without asking';
+  syncChatLayout();
 }
 
 autonomySelect.addEventListener('change', async () => {
@@ -53,6 +44,7 @@ autonomySelect.addEventListener('change', async () => {
   // Selecting an unattended policy for the first time in a project should be a
   // deliberate act, not a stray click on a dropdown.
   if (wanted !== previous && wanted !== 'supervised' && wanted !== 'guarded') {
+    setCompactOptionsOpen(false);
     const confirmed = await confirmDialog(
       `Switch autonomy to "${autonomyPolicies.find((entry) => entry.id === wanted)?.label || wanted}"?\n\n`
       + `${autonomyDescription(wanted)}\n\n`
@@ -95,6 +87,20 @@ let pendingPlanDraft = null;
 let pendingPlanCard = null;
 let updateState = null;
 let currentModelDetails = [];
+let historyEntries = [];
+let historyRequest = 0;
+
+function syncChatLayout() {
+  const hidden = sidebar.classList.contains('hidden');
+  $('history-open-btn').classList.toggle('hidden', !hidden);
+  $('history-btn').setAttribute('aria-expanded', String(!hidden));
+  $('history-open-btn').setAttribute('aria-expanded', String(!hidden));
+  $('approval-status').textContent = autonomyPolicies.find((policy) => policy.id === autonomyPolicy)?.label || 'Supervised';
+  $('approval-status').title = autonomyDescription(autonomyPolicy);
+  $('research-status').textContent = onlineResearchToggle.checked ? 'Web research on' : 'Web research off';
+  $('research-status').classList.toggle('enabled', onlineResearchToggle.checked);
+  input.placeholder = modelSelect.value ? `Message ${modelSelect.value}…` : 'Message the selected model…';
+}
 
 const newIdentity = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 const currentChatRun = () => currentChatId ? chatRuns.get(currentChatId) : null;
@@ -275,6 +281,7 @@ async function reloadModels(preferred = '') {
   const res = await window.api.listModels();
   modelSelect.innerHTML = '';
   if (!res.ok) {
+    $('connection-status').textContent = 'Unavailable';
     currentModels = [];
     currentModelDetails = [];
     activeModelPicker?.refresh([]);
@@ -283,6 +290,7 @@ async function reloadModels(preferred = '') {
     return currentModels;
   }
   currentModels = res.models;
+  $('connection-status').textContent = currentModels.length ? 'Connected' : 'No models';
   currentModelDetails = Array.isArray(res.modelDetails) ? res.modelDetails : [];
   for (const name of currentModels) {
     const opt = document.createElement('option');
@@ -294,6 +302,7 @@ async function reloadModels(preferred = '') {
   activeModelPicker?.refresh(currentModelDetails);
   populateSettingsModelSelects();
   renderOnboarding(currentModels.length ? 'ok' : 'empty', '', res.provider);
+  syncChatLayout();
   return currentModels;
 }
 
@@ -412,6 +421,7 @@ function applySessionDefaults() {
   const preferred = defaultModelForMode(appMode);
   if (preferred && currentModels.includes(preferred)) modelSelect.value = preferred;
   activeModelPicker?.sync();
+  syncChatLayout();
 }
 
 thinkToggle.addEventListener('change', () => localStorage.setItem('think', thinkToggle.checked ? '1' : '0'));
@@ -419,6 +429,7 @@ thinkToggle.addEventListener('change', () => localStorage.setItem('think', think
 autoBranchToggle.addEventListener('change', () => localStorage.setItem('autoBranch', autoBranchToggle.checked ? '1' : '0'));
 reviewToggle.addEventListener('change', () => localStorage.setItem('reviewMode', reviewToggle.checked ? '1' : '0'));
 function confirmOnlineResearch() {
+  setCompactOptionsOpen(false);
   return confirmDialog(
     'Enable ONLINE RESEARCH for this session?\n\nSearch queries and requested page URLs will leave this computer. Every web_search and web_fetch call will still require explicit approval, even when AUTO-APPROVE is on.',
     { okLabel: 'ENABLE' }
@@ -426,12 +437,16 @@ function confirmOnlineResearch() {
 }
 
 onlineResearchToggle.addEventListener('change', async () => {
-  if (!onlineResearchToggle.checked) return;
-  const approved = await confirmOnlineResearch();
-  if (!approved) onlineResearchToggle.checked = false;
+  if (onlineResearchToggle.checked) {
+    const approved = await confirmOnlineResearch();
+    if (!approved) onlineResearchToggle.checked = false;
+    compactOptionsButton.focus();
+  }
+  syncChatLayout();
 });
 
 modelSelect.addEventListener('change', () => {
+  syncChatLayout();
   localStorage.setItem('model', modelSelect.value);
   localStorage.setItem(`model:${appMode}`, modelSelect.value);
 });
@@ -445,10 +460,7 @@ function setAppMode(mode, persist = true, refreshHistory = true) {
   chatModeBtn.classList.toggle('active', appMode === 'chat');
   codeModeBtn.setAttribute('aria-pressed', appMode === 'code' ? 'true' : 'false');
   chatModeBtn.setAttribute('aria-pressed', appMode === 'chat' ? 'true' : 'false');
-  $('sidebar-head').textContent = appMode === 'chat' ? 'CHAT HISTORY' : 'CODE HISTORY';
-  input.placeholder = appMode === 'chat'
-    ? 'Ask anything... (Enter to send, Shift+Enter for newline)'
-    : 'Describe a task... (Enter to send, Shift+Enter for newline)';
+  syncChatLayout();
   if (persist) localStorage.setItem('appMode', appMode);
   syncMissionCard();
   refreshGit();
@@ -609,17 +621,24 @@ $('review-discard-btn').addEventListener('click', async () => {
 
 // ---------- chat history ----------
 async function loadChatHistory() {
+  const request = ++historyRequest;
   const allChats = await window.api.historyList();
-  const chats = allChats.filter((chatEntry) => appMode === 'chat'
+  if (request !== historyRequest) return;
+  historyEntries = allChats;
+  renderChatHistory();
+}
+
+function renderChatHistory() {
+  const chats = window.ChatLayout.filterConversations(historyEntries.filter((chatEntry) => appMode === 'chat'
     ? chatEntry.mode === 'chat'
-    : chatEntry.mode !== 'chat');
+    : chatEntry.mode !== 'chat'), $('chat-search').value);
   chats.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)); // newest first
   chatList.innerHTML = '';
 
   if (chats.length === 0) {
     const noChats = document.createElement('div');
     noChats.className = 'no-chats';
-    noChats.textContent = 'No chats yet';
+    noChats.textContent = $('chat-search').value.trim() ? 'No matching chats' : 'No chats yet';
     chatList.appendChild(noChats);
     return;
   }
@@ -662,6 +681,7 @@ function renderChatItem(c) {
     const title = document.createElement('span');
     title.className = 'chat-title';
     title.textContent = c.title || `Chat ${c.id.substring(0, 8)}`;
+    item.title = [title.textContent, c.cwd, c.model, new Date(c.timestamp).toLocaleString()].filter(Boolean).join('\n');
     const date = document.createElement('span');
     date.className = 'chat-date';
     date.textContent = new Date(c.timestamp).toLocaleString();
@@ -696,13 +716,19 @@ function renderChatItem(c) {
     del.className = 'chat-del';
     del.textContent = '✕';
     del.title = 'Delete this chat';
+    del.setAttribute('aria-label', `Delete ${title.textContent}`);
     del.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (await confirmDialog('Delete this chat?', { okLabel: 'DELETE', danger: true })) deleteChat(c.id);
     });
 
-    item.addEventListener('click', () => loadChat(c.id));
-    item.appendChild(main);
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'chat-open';
+    open.setAttribute('aria-current', c.id === currentChatId ? 'page' : 'false');
+    open.appendChild(main);
+    open.addEventListener('click', () => loadChat(c.id));
+    item.appendChild(open);
     item.appendChild(del);
     chatList.appendChild(item);
   }
@@ -803,6 +829,7 @@ async function loadChat(chatId) {
   // snapshot without asking again. The warning belongs to the action that first
   // enables ONLINE, not to routine navigation between already-saved chats.
   onlineResearchToggle.checked = saved.onlineResearchEnabled === true;
+  syncChatLayout();
   setAppMode(saved.mode === 'chat' ? 'chat' : 'code');
 
   // Push the stored conversation into the main process so the model continues from it.
@@ -823,6 +850,7 @@ async function loadChat(chatId) {
   if (saved.model && [...modelSelect.options].some((o) => o.value === saved.model)) {
     modelSelect.value = saved.model;
     activeModelPicker?.sync();
+    syncChatLayout();
     localStorage.setItem('model', saved.model);
   }
 
@@ -833,7 +861,7 @@ async function loadChat(chatId) {
       setCwd(saved.cwd);
       cwdChanged = true;
     } else {
-      addError(`This chat used ${saved.cwd}, which no longer exists — DIR left unchanged.`);
+      addError(`This chat used ${saved.cwd}, which no longer exists — the project folder is unchanged.`);
     }
   }
 
@@ -1171,7 +1199,7 @@ async function send() {
       ? 'No model selected — check the provider catalog, endpoint, and API key.'
       : 'No model selected — check that the local model server is running.');
   }
-  if (appMode === 'code' && !cwd) return addError('Pick a working directory first (DIR button, top left).');
+  if (appMode === 'code' && !cwd) return addError('Choose a project folder below the model selector first.');
 
   // Ollama wants raw base64 without the data-URL prefix
   const images = pendingImages.map((attachment) => attachment.dataUrl.split(',')[1]);
@@ -1267,7 +1295,7 @@ function endRun() {
 
 function setState(s) {
   const el = $('status-state');
-  el.textContent = s;
+  el.textContent = s === 'idle' ? 'Ready' : s;
   el.classList.toggle('working', s !== 'idle');
 }
 
@@ -2127,9 +2155,20 @@ function hideStartupMessage() {
 }
 
 // ---------- event listeners ----------
-$('history-btn').addEventListener('click', () => {
+// The pressed toggle disappears, so focus moves to its twin. A mouse click
+// (detail > 0) moves focus without the keyboard ring.
+$('history-btn').addEventListener('click', (event) => {
   sidebar.classList.toggle('hidden');
+  syncChatLayout();
+  if (sidebar.classList.contains('hidden')) $('history-open-btn').focus({ focusVisible: event.detail === 0 });
 });
+$('history-open-btn').addEventListener('click', (event) => {
+  sidebar.classList.remove('hidden');
+  syncChatLayout();
+  $('history-btn').focus({ focusVisible: event.detail === 0 });
+});
+$('models-btn').addEventListener('click', () => activeModelPicker?.open());
+$('chat-search').addEventListener('input', renderChatHistory);
 
 const compactOptions = $('compact-options');
 const compactOptionsButton = $('compact-options-btn');
@@ -2137,12 +2176,18 @@ const compactOptionsMenu = $('compact-options-menu');
 function setCompactOptionsOpen(open) {
   compactOptions.classList.toggle('open', open);
   compactOptionsButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+  compactOptionsMenu.inert = !open;
   if (open) {
     const bounds = compactOptionsButton.getBoundingClientRect();
-    compactOptionsMenu.style.top = `${Math.round(bounds.bottom + 6)}px`;
-    compactOptionsMenu.style.right = `${Math.round(window.innerWidth - bounds.right)}px`;
+    compactOptionsMenu.style.top = '';
+    compactOptionsMenu.style.bottom = `${Math.round(window.innerHeight - bounds.top + 8)}px`;
+    compactOptionsMenu.style.right = `${Math.max(12, Math.round(window.innerWidth - bounds.right))}px`;
+    compactOptionsMenu.style.maxHeight = `${Math.max(120, bounds.top - topbar.getBoundingClientRect().bottom - 16)}px`;
   }
 }
+window.addEventListener('resize', () => {
+  if (compactOptions.classList.contains('open')) setCompactOptionsOpen(true);
+});
 compactOptionsButton.addEventListener('click', (event) => {
   event.stopPropagation();
   setCompactOptionsOpen(!compactOptions.classList.contains('open'));
@@ -2178,6 +2223,7 @@ async function newSession() {
 $('new-btn').addEventListener('click', newSession);
 
 async function showSettings() {
+  setCompactOptionsOpen(false);
   if (!appSettings) {
     const res = await window.api.settingsGet();
     if (!res.ok) return addError(res.error || 'Could not load settings.');
@@ -2550,7 +2596,7 @@ async function handleSlash(raw) {
       return showDiff();
 
     case 'graph': {
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       const res = await window.api.gitGraph(cwd);
       if (!res.ok) return addError(res.error);
       return showOverlay('GIT GRAPH — ' + cwd, res.graph);
@@ -2559,7 +2605,7 @@ async function handleSlash(raw) {
     case 'loop': {
       if (busy) return;
       if (!modelSelect.value) return addError('No model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       let iterations = appSettings?.defaultLoopIterations || 8;
       let goal = arg;
       const m = goal.match(/^(\d+)\s+([\s\S]+)/);
@@ -2594,7 +2640,7 @@ async function handleSlash(raw) {
     case 'plan': {
       if (busy) return;
       if (!modelSelect.value) return addError('No planner model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       if (!arg) return addError('Usage: /plan <goal>');
 
       const plannerModel = modelSelect.value;
@@ -2634,7 +2680,7 @@ async function handleSlash(raw) {
     case 'review': {
       if (busy) return;
       if (!modelSelect.value) return addError('No reviewer model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       const reviewCwd = cwd;
       startRun();
       let result;
@@ -2682,7 +2728,7 @@ async function handleSlash(raw) {
       if (busy) return;
       if (!modelSelect.value) return addError('No orchestrator model selected.');
       if (!coderModel) return addError('No coder model selected. Use /coder <name>.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       if (!arg) return addError('Usage: /orchestrate <goal>');
       if (!runsUnattended()) addInfo('Autonomy is supervised, so the coding worker will pause for file writes and commands; online requests always require separate approval.');
 
@@ -2748,7 +2794,7 @@ async function handleSlash(raw) {
       if (busy) return;
       if (!modelSelect.value) return addError('No model selected.');
       if (!coderModel) return addError('No coder model selected. Use /coder <name>.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       let iterations = appSettings?.defaultLoopIterations || 8;
       let goal = arg;
       const match = goal.match(/^(\d+)\s+([\s\S]+)/);
@@ -2924,7 +2970,7 @@ async function handleSlash(raw) {
     case 'auto': {
       if (busy) return;
       if (!arg) return addError('Usage: /auto <request>');
-      if (appMode === 'code' && !cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (appMode === 'code' && !cwd) return addError('Choose a project folder below the model selector first.');
       setState('selecting model…');
       let route;
       try {
@@ -3066,7 +3112,7 @@ async function handleSlash(raw) {
     }
 
     case 'workspace': {
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
       if (arg === 'init') {
         const res = await window.api.workspaceInit(cwd);
         if (!res.ok) return addError(res.error);
@@ -3111,7 +3157,7 @@ async function handleSlash(raw) {
 
     case 'memory': {
       const memoryCwd = appMode === 'chat' ? null : cwd;
-      if (appMode !== 'chat' && !memoryCwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (appMode !== 'chat' && !memoryCwd) return addError('Choose a project folder below the model selector first.');
       if (arg === 'move') {
         if (!memoryCwd) return addError('Folder-free Chat memory is user-wide and cannot move into a project.');
         const moved = await window.api.memoryMove(memoryCwd);
@@ -3135,7 +3181,7 @@ async function handleSlash(raw) {
     case 'agent': {
       if (busy) return;
       if (!modelSelect.value) return addError('No model selected.');
-      if (!cwd) return addError('Pick a working directory first (DIR button, top left).');
+      if (!cwd) return addError('Choose a project folder below the model selector first.');
 
       // Triggers are authored in a file, the way mcp.json already is: entering
       // agent mode there is a setup act, not a session act.
@@ -3555,6 +3601,10 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!$('settings-modal').classList.contains('hidden')) hideSettings();
     else if (!$('overlay').classList.contains('hidden')) hideOverlay();
+    else if (compactOptions.classList.contains('open')) {
+      setCompactOptionsOpen(false);
+      compactOptionsButton.focus();
+    }
     else if (busy || currentChatRun()) {
       const run = currentChatRun();
       window.api.stop(run ? { chatId: currentChatId, runId: run.runId } : undefined);
