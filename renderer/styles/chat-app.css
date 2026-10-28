@@ -37,6 +37,8 @@ button:disabled { cursor: default; opacity: .45; }
 #sidebar-caption { display: block; padding: 6px 12px 0; font-size: 11px; color: var(--text-dim); }
 #workspace { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
 #topbar { gap: 12px; flex-wrap: nowrap; padding: 14px 24px; min-height: 62px; overflow: visible; background: var(--bg); border: 0; }
+/* Above conversation content, below dialogs (100+). */
+#topbar { z-index: 90; }
 #topbar .spacer { display: block !important; flex: 1 !important; }
 #model-select-picker { flex: 0 1 340px; min-width: 130px; max-width: 340px; }
 #model-select-picker .model-picker-button { padding: 5px 0; min-height: 30px; border: 0; background: transparent; font-family: inherit; font-size: 17px; font-weight: 500; }
@@ -98,6 +100,7 @@ body[data-autonomy="unattended"] #approval-status { color: var(--yellow); }
 #compact-options.open #compact-options-menu { display: grid; gap: 10px; }
 #compact-options-menu .toggle { font-family: inherit; font-size: 13px; letter-spacing: 0; padding: 4px; }
 #autonomy-control { flex-wrap: wrap; }
+.setting-suffix { display: flex; align-items: center; gap: 6px; }
 #autonomy-select { max-width: 190px; border-radius: 5px; }
 #send-btn, #stop-btn { min-width: 34px; align-self: center; width: 34px; height: 34px; border: 0; background: #282a2f; color: var(--text); font-weight: 400; }
 #stop-btn { color: var(--red); }
@@ -109,8 +112,9 @@ body[data-autonomy="unattended"] #approval-status { color: var(--yellow); }
 #status-state { color: var(--text-dim); min-width: 0; }
 #status-state.working { color: var(--yellow); }
 #research-status.enabled { color: var(--yellow); }
+#run-details { display: flex; align-items: center; gap: 14px; }
 #run-details summary { cursor: pointer; }
-#run-details-content { position: absolute; bottom: calc(100% + 12px); right: 0; display: grid; gap: 10px; min-width: 180px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-panel); z-index: 50; }
+#run-details-content { display: flex; flex-wrap: wrap; gap: 14px; }
 #attachment-preview { padding: 0 0 10px; }
 #review-bar, #approval-bar, #question-bar { flex-shrink: 0; margin: 0 24px 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
 .review-title, .approval-tool { font-family: inherit; font-size: 12px; letter-spacing: 0; }
