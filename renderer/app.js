@@ -944,7 +944,7 @@ function renderConversation(conversation) {
       const shownText = msg.displayContent || (msg.attachments?.length ? '(attached files)' : msg.content) || (imgs.length ? '(image)' : '');
       addMessage('user', shownText, imgs, msg.attachments || [], { message: msg, index });
     } else if (msg.role === 'assistant') {
-      if (msg.thinking) addThinkingBlock(msg.thinking, 'THOUGHTS ▸');
+      if (msg.thinking) addThinkingBlock(msg.thinking, 'Thoughts');
       if (msg.content) renderMarkdown(addMessage('assistant', '', null, [], { message: msg, index }), msg.content);
       for (const call of msg.tool_calls || []) pendingToolCalls.push(toolCallDetails(call));
     } else if (msg.role === 'tool') {
@@ -1647,7 +1647,7 @@ function addThinkingBlock(text, label) {
 function finalizeThinking() {
   if (!currentThinking) return;
   const secs = ((Date.now() - currentThinking.start) / 1000).toFixed(1);
-  currentThinking.head.textContent = `THOUGHT FOR ${secs}S ▸`;
+  currentThinking.head.textContent = `Thought for ${secs}s`;
   currentThinking.wrap.classList.remove('live');
   currentThinking = null;
 }
@@ -1655,7 +1655,7 @@ function finalizeThinking() {
 window.api.onThinking((t, route) => {
   if (!routeIsVisible(route)) return;
   if (!currentThinking) {
-    const block = addThinkingBlock('', 'THINKING… ▸');
+    const block = addThinkingBlock('', 'Thinking…');
     block.wrap.classList.add('live');
     currentThinking = { ...block, start: Date.now() };
   }
@@ -2167,7 +2167,6 @@ $('history-open-btn').addEventListener('click', (event) => {
   syncChatLayout();
   $('history-btn').focus({ focusVisible: event.detail === 0 });
 });
-$('models-btn').addEventListener('click', () => activeModelPicker?.open());
 $('chat-search').addEventListener('input', renderChatHistory);
 
 const compactOptions = $('compact-options');

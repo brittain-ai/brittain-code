@@ -37,7 +37,7 @@ The built app is a snapshot of the code at build time — editing `main.js` or t
 3. In Code mode, choose the project folder below the model selector. Chat mode has no project file access.
 4. Type a task or question and hit Enter.
 
-The interface follows the Brittain web chat layout. The sidebar contains **New chat**, **Models**, conversation search, and **Settings**. Search finds chat titles, project folders, and model names. The model selector stays at the top of the conversation. In Code mode, the row below it contains the folder, Git actions, and active approval policy.
+The interface follows the Brittain web chat layout. The sidebar contains **New chat**, conversation search, and **Settings**. Search finds chat titles, project folders, and model names. The model selector stays at the top of the conversation. In Code mode, the row below it contains the folder, Git actions, and active approval policy.
 
 **Run options** beside the message field contains THINK, web research, the approval policy, automatic branching, and review mode. Web research still requires confirmation before it is enabled. Context use appears below the message field. **Run details** shows elapsed time, tool calls, speed, and app version.
 

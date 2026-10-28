@@ -59,7 +59,7 @@ button.mini { border: 0; background: transparent; padding: 3px 5px; font-family:
 body[data-autonomy="unattended"] #approval-status { color: var(--yellow); }
 #chat { padding: 20px 36px 32px; gap: 28px; font-size: 16px; }
 #chat > * { max-width: var(--chat-width); flex-shrink: 0; }
-.msg { line-height: 1.7; }
+.msg { line-height: 1.6; }
 .msg > .label { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 .msg.user { padding: 0; background: transparent; border: 0; }
 .msg.user > .body { width: fit-content; max-width: 90%; margin-left: auto; padding: 12px 17px; border-radius: 12px; background: var(--bg-input); }
@@ -79,7 +79,13 @@ body[data-autonomy="unattended"] #approval-status { color: var(--yellow); }
 .tool .tool-head { font-family: inherit; font-size: 12px; padding: 9px 12px; }
 /* Consecutive tool calls read as one run, not separate turns. */
 .tool + .tool { margin-top: -20px; }
-.thinking-head { font-family: inherit; font-size: 11px; letter-spacing: .5px; }
+.thinking { border-left: 0; }
+.thinking-head { display: inline-flex; align-items: center; gap: 6px; padding: 2px 0; font-family: inherit; font-size: 13px; letter-spacing: 0; }
+.thinking-head::after { content: "›"; font-size: 15px; line-height: 1; transition: transform .15s; }
+.thinking:not(.collapsed) .thinking-head::after { transform: rotate(90deg); }
+.thinking pre { margin-top: 8px; padding: 2px 0 2px 14px; border-left: 2px solid var(--border); font-family: inherit; font-size: 13px; line-height: 1.6; }
+/* Thoughts introduce the reply that follows, so keep them close to it. */
+.thinking + .msg.assistant, .thinking + .tool { margin-top: -16px; }
 .context-actions button { font-family: inherit; font-size: 10px; letter-spacing: 0; border-radius: 4px; }
 .msg:focus-within > .context-actions, .tool:focus-within > .context-actions, .subagent:focus-within > .context-actions { opacity: 1; }
 #startup-message { inset: 92px 0 0; pointer-events: none; }
