@@ -13,12 +13,11 @@
   <link rel="stylesheet" href="styles/diff-viewer.css" />
   <link rel="stylesheet" href="styles/context-viewer.css" />
   <link rel="stylesheet" href="styles/review-findings.css" />
-  <link rel="stylesheet" href="styles/chat-app.css" />
 </head>
 <body>
   <div id="attachment-drop-overlay" class="hidden" aria-hidden="true">
     <div id="attachment-drop-box">
-      <strong>DROP TO ATTACH</strong>
+      <strong>Drop to attach</strong>
       <span>screenshots, images, PDFs, text, or code · up to 6 files</span>
     </div>
   </div>
@@ -26,10 +25,7 @@
     <aside id="sidebar" aria-label="Chat history">
       <div id="sidebar-brand">
         <span class="brand">
-          <svg class="brand-logo" viewBox="492 178 424 412" aria-hidden="true" focusable="false">
-            <defs><clipPath id="brand-clip"><path d="M538 564 Q518 564 518 544 V361 Q518 348 528 340 L691 209 Q704 199 716 209 L787 265 V237 Q787 228 796 228 H825 Q835 228 835 238 V302 L881 338 Q890 345 890 360 V545 Q890 564 871 564 Z" /></clipPath></defs>
-            <image href="assets/brittain-logo.png" width="1408" height="768" clip-path="url(#brand-clip)" />
-          </svg>
+          <img class="brand-logo" src="assets/brittain-logo.png" alt="" />
           <span>BRITTAIN</span>
         </span>
         <button id="history-btn" class="icon-button" title="Hide chat history" aria-label="Hide chat history" aria-controls="sidebar" aria-expanded="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="1"/><path d="M10 4v16"/></svg></button>
@@ -77,22 +73,22 @@
           <div id="onboarding-title"></div>
           <div id="onboarding-body"></div>
           <div id="onboarding-actions">
-            <button id="onboarding-recommendations">VIEW RECOMMENDATIONS</button>
-            <button id="onboarding-retry">CHECK AGAIN</button>
-            <button id="onboarding-settings">CHANGE ENDPOINT</button>
-            <button id="onboarding-ollama">OPEN OLLAMA.COM</button>
+            <button id="onboarding-recommendations">View recommendations</button>
+            <button id="onboarding-retry">Check again</button>
+            <button id="onboarding-settings">Change endpoint</button>
+            <button id="onboarding-ollama">Open ollama.com</button>
           </div>
         </div>
       </div>
       <div id="review-bar" class="hidden">
         <div class="review-text">
-          <span class="review-title">REVIEW THIS RUN</span>
+          <span class="review-title">Review this run</span>
           <span id="review-detail"></span>
         </div>
         <div class="review-actions">
-          <button id="review-diff-btn">VIEW DIFF</button>
-          <button id="review-keep-btn" class="approve">KEEP</button>
-          <button id="review-discard-btn" class="deny">DISCARD</button>
+          <button id="review-diff-btn">View diff</button>
+          <button id="review-keep-btn" class="approve">Keep</button>
+          <button id="review-discard-btn" class="deny">Discard</button>
         </div>
       </div>
 
@@ -102,15 +98,15 @@
           <pre id="approval-detail"></pre>
         </div>
         <div class="approval-actions">
-          <button id="approve-btn" class="approve">APPROVE</button>
-          <button id="deny-btn" class="deny">DENY</button>
+          <button id="approve-btn" class="approve">Approve</button>
+          <button id="deny-btn" class="deny">Deny</button>
         </div>
       </div>
 
       <div id="question-bar" class="hidden">
         <div id="question-cards"></div>
         <div id="question-submit-row">
-          <button id="question-submit" disabled>SUBMIT ANSWERS</button>
+          <button id="question-submit" disabled>Submit answers</button>
         </div>
       </div>
 
@@ -151,7 +147,7 @@
     <div id="confirm-box">
       <p id="confirm-message"></p>
       <div id="confirm-actions">
-        <button type="button" id="confirm-cancel">CANCEL</button>
+        <button type="button" id="confirm-cancel">Cancel</button>
         <button type="button" id="confirm-ok" class="approve">OK</button>
       </div>
     </div>
@@ -161,7 +157,7 @@
     <div id="overlay-box">
       <div id="overlay-head">
         <span id="overlay-title"></span>
-        <button id="overlay-close">CLOSE</button>
+        <button id="overlay-close">Close</button>
       </div>
       <div id="overlay-body"></div>
     </div>
@@ -171,10 +167,10 @@
     <form id="settings-form">
       <div class="settings-head">
         <div>
-          <span id="settings-title">SETTINGS</span>
+          <span id="settings-title">Settings</span>
           <span class="settings-subtitle">Applies to new requests and sessions</span>
         </div>
-        <button type="button" id="settings-close">CLOSE</button>
+        <button type="button" id="settings-close">Close</button>
       </div>
       <div class="settings-scroll">
         <section class="settings-section settings-wide">
@@ -182,8 +178,8 @@
           <div class="update-settings-row">
             <span id="settings-update-version"></span>
             <span id="settings-update-status" class="setting-status">Loading update status…</span>
-            <button type="button" id="settings-check-update">CHECK FOR UPDATES</button>
-            <button type="button" id="settings-install-update" class="approve hidden">RESTART TO UPDATE</button>
+            <button type="button" id="settings-check-update">Check for updates</button>
+            <button type="button" id="settings-install-update" class="approve hidden">Restart to update</button>
           </div>
           <p class="setting-help">Official releases check GitHub for newer stable versions. Development and local test builds do not check for updates.</p>
         </section>
@@ -192,7 +188,7 @@
           <h2>INFERENCE ENDPOINT</h2>
           <div class="settings-endpoint-row">
             <input id="setting-endpoint" type="url" spellcheck="false" placeholder="http://127.0.0.1:11434" />
-            <button type="button" id="settings-test-endpoint">TEST</button>
+            <button type="button" id="settings-test-endpoint">Test</button>
           </div>
           <p class="setting-help">Where inference runs: Ollama's host and port, or a cloud provider's API base URL.</p>
           <div id="settings-test-result" class="setting-status"></div>
@@ -204,7 +200,7 @@
           <p id="setting-provider-help" class="setting-help"></p>
 
           <div id="settings-cloud-fields" class="hidden">
-            <label>API key <span class="settings-endpoint-row"><input id="setting-api-key" type="password" spellcheck="false" autocomplete="off" placeholder="paste to set, blank to remove" /><button type="button" id="settings-save-key">SAVE</button></span></label>
+            <label>API key <span class="settings-endpoint-row"><input id="setting-api-key" type="password" spellcheck="false" autocomplete="off" placeholder="paste to set, blank to remove" /><button type="button" id="settings-save-key">Save</button></span></label>
             <div id="settings-key-status" class="setting-status"></div>
             <p class="setting-help">The key is stored outside settings.json and encrypted with your keychain where available. Prices come from the provider's own model listing, so each turn reports what it cost — see <code>/cost</code> for the running total.</p>
           </div>
@@ -224,7 +220,7 @@
           <div id="settings-jev-fields">
             <label>Jev endpoint <input id="setting-jev-endpoint" type="url" spellcheck="false" /></label>
             <label>Jev model <input id="setting-jev-model" type="text" spellcheck="false" /></label>
-            <label>Jev API key <span class="settings-endpoint-row"><input id="setting-jev-key" type="password" spellcheck="false" autocomplete="off" placeholder="paste to set, blank to remove" /><button type="button" id="settings-save-jev-key">SAVE</button></span></label>
+            <label>Jev API key <span class="settings-endpoint-row"><input id="setting-jev-key" type="password" spellcheck="false" autocomplete="off" placeholder="paste to set, blank to remove" /><button type="button" id="settings-save-jev-key">Save</button></span></label>
             <div id="settings-jev-key-status" class="setting-status"></div>
             <p class="setting-help">Jev receives bounded task text, tool arguments, and tool-result excerpts. Auto uses it only for Brittain 4 when this key is set. Shadow records decisions but does not change model context.</p>
           </div>
@@ -236,7 +232,7 @@
           <h2>INTEGRATIONS (MCP)</h2>
           <p class="setting-help">Connect external tool servers (browsers, databases, APIs) over the Model Context Protocol. Servers are defined in a JSON config file; restart the app after editing it.</p>
           <div class="mcp-config-row">
-            <button type="button" id="settings-open-mcp">OPEN MCP CONFIG</button>
+            <button type="button" id="settings-open-mcp">Open MCP config</button>
             <span id="settings-mcp-result" class="setting-status"></span>
           </div>
 
@@ -297,9 +293,9 @@
       </div>
       <div class="settings-actions">
         <span id="settings-save-result" class="setting-status"></span>
-        <button type="button" id="settings-reset">RESET DEFAULTS</button>
-        <button type="button" id="settings-cancel">CANCEL</button>
-        <button type="submit" class="approve">SAVE</button>
+        <button type="button" id="settings-reset">Reset defaults</button>
+        <button type="button" id="settings-cancel">Cancel</button>
+        <button type="submit" class="approve">Save</button>
       </div>
     </form>
   </div>

@@ -49,7 +49,7 @@ autonomySelect.addEventListener('change', async () => {
       `Switch autonomy to "${autonomyPolicies.find((entry) => entry.id === wanted)?.label || wanted}"?\n\n`
       + `${autonomyDescription(wanted)}\n\n`
       + 'Risky tool calls will run without asking. Destructive operations, sensitive reads, and external MCP tools still require approval.',
-      { okLabel: 'SWITCH', danger: true }
+      { okLabel: 'Switch', danger: true }
     );
     if (!confirmed) { autonomySelect.value = previous; return; }
   }
@@ -256,7 +256,7 @@ function renderUpdateState(state) {
 async function installReadyUpdate() {
   if (busy || hasChatRuns()) return addError('Stop active and queued runs before you restart to update.');
   const version = updateState?.version ? ` ${updateState.version}` : '';
-  if (!(await confirmDialog(`Restart Brittain Code and install version${version}?`, { okLabel: 'RESTART' }))) return;
+  if (!(await confirmDialog(`Restart Brittain Code and install version${version}?`, { okLabel: 'Restart' }))) return;
   const result = await window.api.installUpdate();
   if (!result.ok) addError(result.error);
 }
@@ -341,7 +341,7 @@ function renderOnboarding(state, detail, provider = 'ollama') {
   }
 
   if (state === 'unreachable') {
-    title.textContent = 'NO LOCAL MODEL SERVER FOUND';
+    title.textContent = 'No local model server found';
     body.innerHTML = '';
     const p1 = document.createElement('p');
     p1.textContent = detail || 'Brittain Code could not reach an Ollama-compatible endpoint.';
@@ -354,7 +354,7 @@ function renderOnboarding(state, detail, provider = 'ollama') {
     p3.textContent = 'Using a different local server (LM Studio, etc.)? Point Brittain Code at its address instead:';
     body.appendChild(p3);
   } else if (state === 'empty') {
-    title.textContent = 'NO MODELS INSTALLED YET';
+    title.textContent = 'No models installed yet';
     body.innerHTML = '';
     const p1 = document.createElement('p');
     p1.textContent = 'Ollama is running, but no models are pulled. View the Mac benchmark recommendations, or pull a model directly:';
@@ -387,7 +387,7 @@ $('onboarding-retry').addEventListener('click', async () => {
   $('onboarding-retry').textContent = 'CHECKING…';
   await reloadModels(defaultModelForMode(appMode));
   applySessionDefaults();
-  $('onboarding-retry').textContent = 'CHECK AGAIN';
+  $('onboarding-retry').textContent = 'Check again';
 });
 
 $('onboarding-recommendations').addEventListener('click', async () => {
@@ -400,7 +400,7 @@ $('onboarding-recommendations').addEventListener('click', async () => {
   } catch (err) {
     addError('Could not load model recommendations: ' + (err.message || err));
   } finally {
-    button.textContent = 'VIEW RECOMMENDATIONS';
+    button.textContent = 'View recommendations';
   }
 });
 
@@ -432,7 +432,7 @@ function confirmOnlineResearch() {
   setCompactOptionsOpen(false);
   return confirmDialog(
     'Enable ONLINE RESEARCH for this session?\n\nSearch queries and requested page URLs will leave this computer. Every web_search and web_fetch call will still require explicit approval, even when AUTO-APPROVE is on.',
-    { okLabel: 'ENABLE' }
+    { okLabel: 'Enable' }
   );
 }
 
@@ -475,7 +475,7 @@ async function chooseAppMode(mode) {
   if (pendingPlanDraft) consequences.push('The current plan draft will be cancelled.');
   if (consequences.length && !(await confirmDialog(
     `Switch to ${mode.toUpperCase()} and start a new session?\n\n${consequences.join('\n')}`,
-    { okLabel: 'SWITCH' },
+    { okLabel: 'Switch' },
   ))) return;
   if (pendingPlanDraft) clearPendingPlan();
   setAppMode(mode);
@@ -512,7 +512,7 @@ async function confirmAgentRun(projectPath, policyId) {
     + 'Actions the policy does not permit are held in the run\'s review tray rather than '
     + 'performed. Spending money still requires your approval at the moment it happens.\n\n'
     + 'You are responsible for what an unattended run does. Continue?',
-    { okLabel: 'RUN UNATTENDED', danger: true }
+    { okLabel: 'Run unattended', danger: true }
   );
   if (confirmed) {
     agentAcknowledged.add(projectPath);
@@ -521,7 +521,7 @@ async function confirmAgentRun(projectPath, policyId) {
   return confirmed;
 }
 
-function confirmDialog(message, { okLabel = 'OK', cancelLabel = 'CANCEL', danger = false } = {}) {
+function confirmDialog(message, { okLabel = 'OK', cancelLabel = 'Cancel', danger = false } = {}) {
   return new Promise((resolve) => {
     const modal = $('confirm-modal');
     const okBtn = $('confirm-ok');
@@ -578,7 +578,7 @@ window.api.onCheckpointState(({ available, cwd: ckptCwd }) => {
 
 undoBtn.addEventListener('click', async () => {
   if (busy || hasChatRuns() || undoBtn.disabled) return;
-  if (!(await confirmDialog('Restore all files in this folder to the checkpoint taken before the last run?\n\n(The current state is checkpointed first — press UNDO again to re-apply the run.)', { okLabel: 'RESTORE' }))) return;
+  if (!(await confirmDialog('Restore all files in this folder to the checkpoint taken before the last run?\n\n(The current state is checkpointed first — press UNDO again to re-apply the run.)', { okLabel: 'Restore' }))) return;
   const res = await window.api.undoCheckpoint(cwd);
   if (res.ok) {
     addInfo(`UNDO: restored working tree to the ${res.restoredFrom} checkpoint (was: ${res.changes}). A pre-undo checkpoint was saved — UNDO again to swap back.`);
@@ -610,7 +610,7 @@ $('review-keep-btn').addEventListener('click', () => {
 $('review-diff-btn').addEventListener('click', showDiff);
 
 $('review-discard-btn').addEventListener('click', async () => {
-  if (!(await confirmDialog('Discard this run? All files return to the pre-run checkpoint.', { okLabel: 'DISCARD', danger: true }))) return;
+  if (!(await confirmDialog('Discard this run? All files return to the pre-run checkpoint.', { okLabel: 'Discard', danger: true }))) return;
   const res = await window.api.undoCheckpoint(cwd);
   hideReview();
   if (res.ok) addInfo('REVIEW: run discarded — files restored to the pre-run checkpoint (UNDO again re-applies it).');
@@ -719,7 +719,7 @@ function renderChatItem(c) {
     del.setAttribute('aria-label', `Delete ${title.textContent}`);
     del.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (await confirmDialog('Delete this chat?', { okLabel: 'DELETE', danger: true })) deleteChat(c.id);
+      if (await confirmDialog('Delete this chat?', { okLabel: 'Delete', danger: true })) deleteChat(c.id);
     });
 
     const open = document.createElement('button');
