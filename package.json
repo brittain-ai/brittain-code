@@ -6,7 +6,7 @@
   "author": "Luke Brittain",
   "repository": {
     "type": "git",
-    "url": "https://github.com/LukeMcB1128/brittain-code.git"
+    "url": "https://github.com/brittain-ai/brittain-code.git"
   },
   "main": "main.js",
   "scripts": {

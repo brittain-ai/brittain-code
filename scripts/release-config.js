@@ -23,7 +23,7 @@ module.exports = {
   mac,
   publish: [{
     provider: 'github',
-    owner: 'LukeMcB1128',
+    owner: 'brittain-ai',
     repo: 'brittain-code',
     // Platform jobs upload into one draft. CI publishes it only after every
     // required artifact exists, so clients cannot see a partial release.
