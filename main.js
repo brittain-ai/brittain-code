@@ -1434,7 +1434,7 @@ function parseRawToolCalls(content) {
 }
 
 // ---------- live psychosis detector ----------
-// Catches the exact failure signatures from fablereview.md WHILE the model is
+// Catches the exact failure signatures from docs/fablereview.md WHILE the model is
 // still generating, instead of discovering them after the fact in a written
 // file. On a hit, the in-flight generation is cancelled immediately; the
 // caller (runAgentTurn) gets one chance to recover via compaction — the same
@@ -2243,7 +2243,7 @@ async function runAgentTurn(model, cwd, autoApprove, think, subModel, onlineRese
       }
 
       // Auto-compaction protects generation quality before the window overflows
-      // (glitch tokens, thought-leak into files — see fablereview.md), so this
+      // (glitch tokens, thought-leak into files — see docs/fablereview.md), so this
       // is a quality guard, not just a size guard
       if (contextLength) {
         const measured = lastStats ? lastStats.promptTokens + lastStats.evalTokens : 0;

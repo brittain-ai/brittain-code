@@ -26,10 +26,26 @@ jobs:
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
           test "${PACKAGE_VERSION#*-}" = "${PACKAGE_VERSION}"
-          test -s "RELEASE_NOTES-${PACKAGE_VERSION}.md"
+          test -s "docs/releases/${PACKAGE_VERSION}.md"
+
+  # electron-builder creates the draft if none exists, so parallel platform
+  # jobs race and can each create one. Create it once, up front.
+  draft:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Create draft release
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists"
+          else
+            gh release create "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --draft --verify-tag --title "${GITHUB_REF_NAME#v}" --notes ""
+          fi
 
   mac:
-    needs: test
+    needs: draft
     strategy:
       fail-fast: false
       matrix:
@@ -57,9 +73,16 @@ jobs:
         run: npx electron-builder --config scripts/release-config.js --mac dmg zip --${{ matrix.arch }} --publish always
       - name: Verify Electron window security
         run: npx electron scripts/window-security-smoke.js
+      # Both mac jobs upload latest-mac.yml and the later one overwrites the
+      # other, so the publish job merges the two copies kept here.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latest-mac-${{ matrix.arch }}
+          path: dist/latest-mac.yml
+          if-no-files-found: error
 
   windows:
-    needs: test
+    needs: draft
     runs-on: windows-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -84,5 +107,13 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: latest-mac-*
+      - name: Merge latest-mac.yml
+        run: |
+          mkdir -p merged
+          node scripts/merge-latest-mac.js latest-mac-x64/latest-mac.yml latest-mac-arm64/latest-mac.yml merged/latest-mac.yml
+          gh release upload "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" merged/latest-mac.yml --clobber
       - name: Publish complete release
-        run: gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --notes-file "RELEASE_NOTES-${GITHUB_REF_NAME#v}.md" --draft=false --latest
+        run: gh release edit "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --notes-file "docs/releases/${GITHUB_REF_NAME#v}.md" --draft=false --latest
